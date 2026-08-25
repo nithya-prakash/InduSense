@@ -63,6 +63,9 @@ const openAPISpec = `{
     "/factories/{id}/production-lines": {
       "get": {"summary": "List a factory's production lines", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Production lines"}}}
     },
+    "/production-lines/{id}/machines": {
+      "get": {"summary": "List a production line's machines", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Machines"}}}
+    },
     "/machines/{id}": {
       "get": {"summary": "Get one machine", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Machine"}, "404": {"description": "Not found"}}}
     },

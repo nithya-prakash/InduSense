@@ -141,6 +141,53 @@ func handleGetMachine(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
+// handleListLineMachines lists the machines under one production line —
+// the missing rung in the factory -> production line -> machine drill-down
+// the dashboard needs, added here rather than in the initial Phase 10 pass
+// since the frontend is what surfaced the gap.
+func handleListLineMachines(pool *pgxpool.Pool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims := claimsFromContext(r.Context())
+		lineID := r.PathValue("id")
+
+		var exists bool
+		if err := pool.QueryRow(r.Context(), `
+			SELECT EXISTS(
+				SELECT 1 FROM production_lines pl
+				JOIN factories f ON f.id = pl.factory_id
+				WHERE pl.id = $1 AND f.organization_id = $2
+			)`, lineID, claims.OrganizationID).Scan(&exists); err != nil {
+			writeInternalError(w, r, err)
+			return
+		}
+		if !exists {
+			writeError(w, r, http.StatusNotFound, "NOT_FOUND", "production line does not exist")
+			return
+		}
+
+		rows, err := pool.Query(r.Context(),
+			`SELECT id, name, machine_type, status FROM machines WHERE production_line_id = $1 ORDER BY name`,
+			lineID,
+		)
+		if err != nil {
+			writeInternalError(w, r, err)
+			return
+		}
+		defer rows.Close()
+
+		var out []machineDTO
+		for rows.Next() {
+			var m machineDTO
+			if err := rows.Scan(&m.ID, &m.Name, &m.MachineType, &m.Status); err != nil {
+				writeInternalError(w, r, err)
+				return
+			}
+			out = append(out, m)
+		}
+		writeJSON(w, http.StatusOK, newPaginatedResponse(out, len(out), 0))
+	}
+}
+
 func handleListMachineDevices(pool *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims := claimsFromContext(r.Context())

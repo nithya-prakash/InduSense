@@ -109,6 +109,7 @@ func registerRoutes(
 	mux.Handle("GET /api/v1/factories", chain(authed(handleListFactories(pool), auth.PermFactoriesRead), defaultLimit))
 	mux.Handle("GET /api/v1/factories/{id}", authed(handleGetFactory(pool), auth.PermFactoriesRead))
 	mux.Handle("GET /api/v1/factories/{id}/production-lines", authed(handleListProductionLines(pool), auth.PermFactoriesRead))
+	mux.Handle("GET /api/v1/production-lines/{id}/machines", authed(handleListLineMachines(pool), auth.PermFactoriesRead))
 	mux.Handle("GET /api/v1/machines/{id}", authed(handleGetMachine(pool), auth.PermFactoriesRead))
 	mux.Handle("GET /api/v1/machines/{id}/devices", authed(handleListMachineDevices(pool), auth.PermDevicesRead))
 

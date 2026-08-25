@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+/*
+ * This dashboard is deliberately light-only for now — no dark theme has
+ * been designed, so it doesn't try to half-follow prefers-color-scheme.
+ * (The scaffold's default dark-mode media query was removed here because
+ * un-layered CSS like it overrides Tailwind's @layer utilities regardless
+ * of class specificity, which fought with the bg-gray-50/bg-white classes
+ * used throughout.)
+ */
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}

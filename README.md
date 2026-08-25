@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 10 of 18 (APIs) complete.** This README will be
+> **Status: Phase 11 of 18 (Dashboard) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -500,13 +500,81 @@ admin API surface for browsing it doesn't exist yet); `/ws/incidents`
 has a `Publisher` interface ready for this, just not wired to a writer);
 device-count-aware pagination cursors (offset pagination only).
 
-Not yet built: frontend, Grafana/Jaeger, Kubernetes manifests, CI/CD, and
+## Current status (Phase 11 — Dashboard)
+
+[frontend/](frontend/) is a Next.js 16 + TypeScript app (App Router,
+Turbopack, Tailwind CSS) covering every page the spec asks for: Overview,
+Factory drill-down, Machine detail with live telemetry charts, Alerts,
+Incidents, Devices, Administration.
+
+**Client-rendered by design, not server components everywhere.** Every
+data-fetching page is a Client Component that calls the REST API directly
+with the browser-held JWT — a deliberate simplification over Next.js
+Server Components/Server Actions, since this app's auth model (bearer
+tokens in `localStorage`, refreshed by the client) doesn't map cleanly onto
+per-request server-side token forwarding without meaningfully more
+plumbing. Dynamic route pages (`/factories/[id]`, `/machines/[id]`,
+`/incidents/[id]`) still follow Next 16's requirement that `params` be
+awaited in an async Server Component — that outer shell just extracts the
+id and hands it to a Client Component.
+
+**RBAC drives the UI, not just the API** — verified live by logging in as
+each of two different roles and confirming the DOM actually differs, not
+just reading the code: as ADMIN, the Alerts page shows "Acknowledge"
+buttons and the Incidents detail page shows an Actions panel; as VIEWER
+(no `alerts:manage`/`incidents:manage`), those controls are simply absent
+while the underlying data remains fully visible — the same
+read-without-write split enforced server-side in Phase 10, now visible in
+the browser.
+
+**The full incident lifecycle was exercised through the actual UI**, not
+just curled: clicking "Move to ACKNOWLEDGED" updated the status badge,
+removed the now-invalid action buttons (only `INVESTIGATING`/`RESOLVED`
+remained, matching the state machine), and appended a real audit-history
+entry with a live timestamp — all sourced from the same Postgres rows
+Phase 10's tests already verified.
+
+**`/ws/alerts` drives a live "● live" indicator and the Alerts table** —
+acknowledging an alert updates its badge immediately via the REST call's
+response, and the WebSocket connection is what the indicator reflects
+(verified by watching it read "○ connecting..." then "● live" as the
+socket came up).
+
+A real bug surfaced immediately by actually loading the page in a browser
+(not by reading the code): the scaffold's default dark-mode CSS block used
+un-layered rules that silently beat every Tailwind utility class regardless
+of specificity, rendering the whole dashboard near-black. Removed in favor
+of an explicitly light-only theme, since no dark theme was designed. A
+second, more subtle one: `create-next-app`'s scaffold put the sidebar's
+`h-screen` on a flex item without `sticky` positioning, which looked fine
+in normal browser scrolling but showed a clipped, overlapping sidebar in a
+full-page (beyond-viewport) screenshot — confirmed as a screenshot-capture
+artifact, not a real user-facing bug, by resizing to a fixed viewport and
+actually scrolling; fixed with `sticky top-0 self-start` regardless, since
+it's the more correct pattern either way.
+
+While building the Factory drill-down page, the frontend surfaced a real
+API gap: there was no endpoint to list a production line's machines. Added
+`GET /api/v1/production-lines/{id}/machines` to `services/api` (Phase 10)
+rather than working around it in the UI — exactly the kind of thing you
+only find by actually using what you built.
+
+```bash
+make up   # frontend included in the default stack
+# http://localhost:3000 — demo login: admin@musterfabrik-gmbh.de / ChangeMe123!
+```
+
+**Not implemented in this phase**: user creation/role-assignment UI (no
+backend endpoint exists yet — the Administration page says so explicitly
+rather than faking one); a chart library beyond Recharts line charts (no
+gauge/heatmap views); offline/optimistic UI for flaky connections.
+
+Not yet built: Grafana/Jaeger, Kubernetes manifests, CI/CD, and
 most formal testing (tests so far are unit tests for pure logic plus
-live-Postgres/Redis integration tests for incidents and auth — the rest of
-the live MQTT/Kafka/Redis/InfluxDB/Postgres verification across services
-was done manually against real infra, not yet captured as a
+live-Postgres/Redis integration tests for incidents and auth, plus this
+phase's live browser verification — none of which is yet captured as a
 permanent automated test; that lands in Phase 13). These land in
-Phases 11–18.
+Phases 12–18.
 
 ## Local setup
 

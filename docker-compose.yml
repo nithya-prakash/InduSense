@@ -143,6 +143,44 @@ services:
     networks: [indusense-net]
 
   # ---------------------------------------------------------------------------
+  # Application services — Phase 4+
+  # ---------------------------------------------------------------------------
+
+  ingestion:
+    build:
+      context: .
+      dockerfile: services/ingestion/Dockerfile
+    container_name: indusense-ingestion
+    ports:
+      - "8081:8081"
+    environment:
+      MQTT_BROKER_HOST: mosquitto
+      MQTT_BROKER_PORT: "1883"
+      MQTT_CLIENT_ID_PREFIX: ${MQTT_CLIENT_ID_PREFIX:-indusense}
+      MQTT_QOS: ${MQTT_QOS:-1}
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC_TELEMETRY_RAW: ${KAFKA_TOPIC_TELEMETRY_RAW:-telemetry.raw}
+      KAFKA_TOPIC_DEVICE_EVENTS: ${KAFKA_TOPIC_DEVICE_EVENTS:-device.events}
+      KAFKA_TOPIC_DEAD_LETTER: ${KAFKA_TOPIC_DEAD_LETTER:-dead-letter}
+      INGESTION_WORKER_POOL_SIZE: ${INGESTION_WORKER_POOL_SIZE:-50}
+      INGESTION_QUEUE_CAPACITY: ${INGESTION_QUEUE_CAPACITY:-10000}
+      INGESTION_PORT: ${INGESTION_PORT:-8081}
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init-topics:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks: [indusense-net]
+
+  # ---------------------------------------------------------------------------
   # Sensor simulator — on-demand only (not part of `docker compose up`).
   # Run with `make simulate` or `docker compose --profile simulate up simulator`.
   # ---------------------------------------------------------------------------

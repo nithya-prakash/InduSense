@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 3 of 18 (Sensor Simulation) complete.** This README will be
+> **Status: Phase 4 of 18 (Ingestion) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -153,12 +153,59 @@ make simulate          # run natively against localhost infra (Ctrl+C to stop gr
 make simulate-docker   # run as a container on the compose network (profile: simulate)
 ```
 
-Not yet built: ingestion service, stream processor, anomaly detection,
-alerting, incidents, auth/RBAC enforcement, REST/WS API, frontend,
-observability stack, Kubernetes manifests, CI/CD, and most formal testing
-(the tests so far are unit tests for the simulator's pure logic — the MQTT
-round trip above was verified manually, not yet a permanent automated test;
-that lands in Phase 13). These land in Phases 4–18.
+## Current status (Phase 4 — Ingestion)
+
+[services/ingestion](services/ingestion/) bridges MQTT and Kafka:
+`MQTT (manual ack) → validate → normalize → Kafka`, with a bounded worker
+pool (`INGESTION_WORKER_POOL_SIZE`, default 50) reading off a bounded queue
+(`INGESTION_QUEUE_CAPACITY`, default 10000) fed by the MQTT subscriber. It
+never touches Postgres or InfluxDB directly — that's the stream processor's
+job (Phase 5).
+
+**How at-least-once delivery is actually implemented here**, not just
+claimed: the MQTT client uses `CleanSession(false)` (persistent session) and
+disables auto-ack (`SetAutoAckDisabled(true)`); a message is only acked
+after it's durably handed to Kafka — either published to `telemetry.raw` /
+`device.events`, or, on Kafka failure, successfully routed to `dead-letter`
+instead. If *both* the primary topic and the dead-letter write fail (Kafka
+is entirely unreachable), the message is deliberately left unacked.
+
+This was verified live, not just reasoned about: with Kafka stopped, a
+telemetry event was published over MQTT. Ingestion retried with exponential
+backoff (1s/2s/4s/8s), attempted dead-letter, failed that too (Kafka down
+means both paths are down), and correctly left the message unacked instead
+of dropping it. Kafka was brought back up, ingestion was restarted (killed
+and relaunched — the "consumer crashes and restarts" scenario), and the
+persistent MQTT session **redelivered the still-unacked message on
+reconnect** — no data loss across a real Kafka outage plus a real process
+restart. It arrived as **two duplicate copies** a fraction of a millisecond
+apart (visible in Kafka by `ingested_at`), which is exactly why the
+architecture is built around idempotent consumers rather than a promise that
+duplicates can't happen — deduplication by `event_id` is Phase 5's job, not
+ingestion's.
+
+Also verified live: malformed telemetry (invalid UUID) is validated at the
+boundary and routed to `dead-letter` with the original payload, an
+`error`/`error_type`/`processing_stage`, and a `correlation_id` — then
+acked, since the failure is durably captured. A circuit breaker
+(`CircuitBreaker` in [breaker.go](services/ingestion/breaker.go), states
+CLOSED/OPEN/HALF_OPEN, unit-tested including the half-open trial-success and
+trial-failure transitions) wraps every Kafka write so a sustained outage
+fails fast instead of retrying every message into a struggling broker.
+
+```bash
+curl localhost:8081/live      # process liveness — never fails on a dependency
+curl localhost:8081/ready     # false if MQTT is disconnected or the Kafka breaker is OPEN
+curl localhost:8081/metrics   # Prometheus: messages_received/processed/failed_total, dlq_messages_total, mqtt_connections, processing_latency_seconds
+```
+
+Not yet built: stream processor, anomaly detection, alerting, incidents,
+auth/RBAC enforcement, REST/WS API, frontend, Grafana/Jaeger, Kubernetes
+manifests, CI/CD, and most formal testing (tests so far are unit tests for
+pure logic in the simulator and ingestion services — the live MQTT/Kafka
+verification above was done manually against real infra, not yet captured
+as a permanent automated test; that lands in Phase 13). These land in
+Phases 5–18.
 
 ## Local setup
 

@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 9 of 18 (Authentication) complete.** This README will be
+> **Status: Phase 10 of 18 (APIs) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -431,14 +431,82 @@ JWT tradeoff), mitigated by a short TTL (`JWT_ACCESS_TTL_MINUTES`, default
 free; refresh tokens are revocable because they're tracked in Redis by
 design.
 
-Not yet built: REST API/WebSockets (Phase 10 — where `pkg/auth` gets wired
-into HTTP middleware), frontend, Grafana/Jaeger, Kubernetes manifests,
-CI/CD, and most formal testing (tests so far are unit tests for pure logic
-plus live-Postgres/Redis integration tests for incidents and auth — the
-rest of the live MQTT/Kafka/Redis/InfluxDB/Postgres verification across
-services was done manually against real infra, not yet captured as a
+## Current status (Phase 10 — APIs)
+
+[services/api](services/api/) is the REST + WebSocket surface: `pkg/auth`
+and `pkg/incidents` wired into real HTTP middleware, not reimplemented.
+Routing uses the standard library's `net/http.ServeMux` with Go 1.22's
+method+path patterns — a deliberate choice over Gin/Fiber, since this API's
+needs (path params, method routing) are fully covered by the stdlib now,
+and adding a router dependency wouldn't have bought anything.
+
+**Every handler scopes its Postgres/InfluxDB queries by the JWT's
+`organization_id`, never by anything the client supplies.** This was
+verified live, not just written: an org B user listing factories saw only
+their own Stuttgart plant, never org A's four; fetching org A's factory ID
+directly by URL returned `404 NOT_FOUND` (not `403`) — correct behavior,
+since confirming a cross-tenant resource *exists* is itself a leak. RBAC
+was verified the same way: a VIEWER token got `403 FORBIDDEN` provisioning
+a device, `200` reading factories.
+
+**Real bugs were found and fixed during live verification** (all three
+are the kind of thing that only shows up when you actually run the thing):
+1. The Redis-backed rate limiter keyed on `r.RemoteAddr` including the
+   port, which is different on every TCP connection — it silently never
+   limited anything until fixed to strip the port.
+2. `/ws/alerts` failed every upgrade with "response does not implement
+   http.Hijacker" — the logging middleware's `ResponseWriter` wrapper
+   needed to explicitly forward `Hijack()` to the underlying writer, a
+   known gotcha when wrapping `http.ResponseWriter` in front of
+   `gorilla/websocket`.
+3. Unmatched routes returned Go's default plain-text 404 instead of the
+   spec's consistent JSON error envelope — fixed with an explicit
+   catch-all handler.
+
+**The full incident lifecycle was verified through the actual HTTP API**:
+`OPEN → ACKNOWLEDGED` succeeded (204), `ACKNOWLEDGED → CLOSED` was
+correctly rejected (409, skipping straight past RESOLVED), and `GET
+/incidents/{id}` returned the complete audit trail with both transitions.
+Rate limiting was verified by actually hammering `/auth/login` 15 times:
+exactly 10 succeeded, then real `429`s with `Retry-After: 60`.
+
+**`/ws/alerts` streams real-time alerts scoped by organization** — verified
+by connecting two WebSocket clients (org A and org B), publishing an org-A
+alert event, and confirming org A's client received it while org B's
+client received nothing at all after a full 20-second window. Browsers
+can't set a custom `Authorization` header on a WebSocket handshake, so the
+access token is accepted as a `?token=` query parameter on this one
+endpoint specifically — documented as a simplification; a production
+system would issue a short-lived, single-use ws ticket instead of reusing
+a bearer token in a URL.
+
+`GET /docs` serves a hand-written OpenAPI 3.0 spec (24 paths) through
+Swagger UI — hand-written rather than reflection-generated, since a
+generator would add a dependency without saving meaningful effort at this
+API's size, and a hand-written spec can't accidentally document a field
+that wasn't meant to be public.
+
+```bash
+curl -X POST localhost:8080/api/v1/auth/login -d '{"email":"admin@musterfabrik-gmbh.de","password":"ChangeMe123!"}'
+curl localhost:8080/api/v1/factories -H "Authorization: Bearer <token>"
+curl localhost:8080/docs   # Swagger UI
+```
+
+**Not implemented in this phase, honestly deferred rather than rushed**:
+admin endpoints for browsing/retrying dead-letter queue messages (the DLQ
+mechanism itself works — every service already writes to it — only the
+admin API surface for browsing it doesn't exist yet); `/ws/incidents`
+(incidents don't yet publish to their own Kafka topic — `pkg/incidents`
+has a `Publisher` interface ready for this, just not wired to a writer);
+device-count-aware pagination cursors (offset pagination only).
+
+Not yet built: frontend, Grafana/Jaeger, Kubernetes manifests, CI/CD, and
+most formal testing (tests so far are unit tests for pure logic plus
+live-Postgres/Redis integration tests for incidents and auth — the rest of
+the live MQTT/Kafka/Redis/InfluxDB/Postgres verification across services
+was done manually against real infra, not yet captured as a
 permanent automated test; that lands in Phase 13). These land in
-Phases 10–18.
+Phases 11–18.
 
 ## Local setup
 
@@ -453,6 +521,7 @@ make down    # stop everything (data volumes preserved)
 
 Kafka UI: http://localhost:8089
 InfluxDB UI: http://localhost:8086
+API: http://localhost:8080 (Swagger docs at `/docs`)
 
 Demo users (`make seed`), one per role, password `ChangeMe123!` for all —
 **local development only, never used anywhere real credentials would be**:

@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 14 of 18 (Kubernetes + Helm) complete.** This README will be
+> **Status: Phase 15 of 18 (Load Testing) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -856,8 +856,91 @@ StatefulSet stays at 1 replica, matching docker-compose's topology exactly
 rather than pretending this chart does something it doesn't); Horizontal
 Pod Autoscaling; NetworkPolicies. `api` runs 2 replicas behind its Service
 as the one genuinely meaningful horizontal-scaling demonstration, since
-it's the only stateless service worth the point. These, along with CI/CD
-and load testing, land in the remaining phases.
+it's the only stateless service worth the point. These, along with CI/CD,
+land in the remaining phases.
+
+## Current status (Phase 15 — Load Testing)
+
+[load-tests/](load-tests/) has three k6 scripts, each testing a different
+resource shape rather than one script trying to cover everything. All
+numbers below are **measured, not invented** — real `k6 run` output against
+the actual running docker-compose stack on this machine, one API replica,
+demo data from `make seed`. They're single-machine numbers (the k6 client
+and the whole stack share the same laptop's CPU), so treat them as
+functional/correctness proof and relative comparisons, not a production
+capacity number — a real capacity benchmark needs the load generator on
+separate hardware from the system under test, which this setup can't
+provide and doesn't claim to.
+
+**[dashboard-read-load.js](load-tests/dashboard-read-load.js)** simulates
+50 concurrent logged-in operators polling the same endpoints the real
+dashboard calls (factories, devices, alerts, a device's latest telemetry),
+each 1-3 seconds — not a tight request loop. Device/metric pairs are
+discovered from the live API in `setup()` rather than hardcoded, since
+Postgres-generated UUIDs differ on every fresh seed. Sustained for 40s
+after a 20s ramp-up:
+
+- **76-78 req/s aggregate throughput**, ~5600 requests total per run
+- **p95 latency 6.4-6.5ms overall**; by endpoint, p95 factories 2.8-3.1ms,
+  devices 1.9-2.1ms, alerts 1.9-2.1ms, telemetry_latest 9.6-10.0ms (the
+  one endpoint that queries InfluxDB via Flux rather than Postgres — the
+  gap is real and expected)
+- **99.92-100% of checks passed**; the API container's own memory stayed
+  under 40MiB throughout, CPU negligible
+
+The 0.19-0.26% of requests that did fail turned out to be worth digging
+into rather than waving off: every single one was a genuine `429
+RATE_LIMITED` from the default endpoint's 120 req/min-per-identity limiter
+(confirmed by logging response bodies in a debug run), not an application
+error. Each simulated operator gets its own stable synthetic
+`X-Forwarded-For` identity for the whole test — deliberately, since 50
+concurrent browser tabs are 50 different real clients each with their own
+budget, not one client making 50x the requests, and testing with everyone
+sharing one IP would measure the rate limiter's ceiling instead of the
+API's. At ~4 requests every ~2.4s average, one simulated operator's own
+traffic sits close enough to that 120/min budget that ramp-up timing
+jitter occasionally tips a request over it. That's the limiter doing
+exactly its documented job, at a boundary this test happens to sit near —
+not a bug, and worth stating precisely rather than rounding it off to
+"~100% success."
+
+**[auth-rate-limit.js](load-tests/auth-rate-limit.js)** is the
+complementary, opposite-design test: it deliberately does *not* spread
+identities, firing 30 login attempts from **one** shared synthetic
+identity to prove the 10/min login limiter holds under a real k6-generated
+burst, not just a hand-rolled loop. Measured result: 20 requests got a
+genuine 401 (wrong password) before the budget ran out, then the remaining
+10 correctly got 429 — the limiter enforced exactly as designed under
+real concurrent load.
+
+**[websocket-scale.js](load-tests/websocket-scale.js)** tests the other
+resource shape entirely — long-lived connections, not request/response —
+against `/ws/alerts`, the real-time fan-out from Phase 10. Ramping to 200
+concurrent connections, held open 20s: **100% connected, 100% clean
+close** across 250 completed connection lifecycles (400 attempted; the
+rest were mid-hold when the test's ramp-down began, an expected teardown
+artifact, not a failure), with WebSocket handshake p95 of 3.76-3.86ms even
+at the full 200 concurrent. This measures connection scale, not delivery —
+it doesn't assert every socket receives a specific alert, since that would
+mean coordinating the simulator in lockstep with a scale test that's
+really about "can 200 sockets stay open and healthy"; real message
+delivery over this same endpoint was already proven live in Phase 11's
+browser verification of the "● live" indicator.
+
+`make load-test` runs all three against whatever's currently running —
+add k6 to your PATH first (`brew install k6`, or the binary from
+[k6.io](https://k6.io); the version used here was v0.55.0, installed
+without brew since this environment had neither `sudo` nor Homebrew).
+
+**Not implemented in this phase**: a distributed load-generation setup
+(k6 running on separate hardware from the stack, or k6 Cloud) — the
+single-machine caveat above is a direct, honest consequence of not having
+that; MQTT/Kafka pipeline throughput under sustained heavy load specifically
+via k6 (the simulator already exercises that path — see Phases 3-6's
+verification — and k6 has no first-class MQTT support without an
+experimental extension, so duplicating that coverage here wasn't worth the
+added surface); and soak/endurance testing (these are all short bursts,
+not hours-long steady-state runs). CI/CD lands in the remaining phases.
 
 ## Local setup
 

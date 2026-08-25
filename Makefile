@@ -94,9 +94,11 @@ simulate:
 simulate-docker:
 	$(COMPOSE) --profile simulate up --build simulator
 
-## load-test: run k6 load tests
+## load-test: run all k6 load tests against the running stack (requires `make seed`)
 load-test:
-	@echo "NOT YET IMPLEMENTED — added in Phase 15 (Load Testing)"
+	k6 run load-tests/dashboard-read-load.js
+	k6 run load-tests/auth-rate-limit.js
+	k6 run load-tests/websocket-scale.js
 
 ## demo: full scripted demo (infra -> migrate -> seed -> simulate -> dashboard)
 demo:

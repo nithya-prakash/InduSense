@@ -1,4 +1,4 @@
-package main
+package incidents
 
 import (
 	"context"
@@ -16,8 +16,7 @@ import (
 // Postgres instance, not a mock. It creates its own throwaway
 // organization/factory/machine row so it doesn't collide with the seeded
 // demo data's "one active incident per machine" constraint, and cleans up
-// after itself. Skipped if no live Postgres is reachable (e.g. in an
-// environment without Docker Compose running).
+// after itself. Skipped if no live Postgres is reachable.
 func TestIncidentLifecycleAgainstRealPostgres(t *testing.T) {
 	dsn := os.Getenv("ALERT_POSTGRES_DSN")
 	if dsn == "" {
@@ -65,13 +64,9 @@ func TestIncidentLifecycleAgainstRealPostgres(t *testing.T) {
 		t.Fatalf("insert test technician: %v", err)
 	}
 
-	incidents := newIncidentStore(pool)
+	store := NewStore(pool, nil)
 
-	// incidents.alert_id is a real foreign key into alerts, so — matching
-	// how the real flow works (store.createIfDue always persists the alert
-	// row before openOrAttachIncident is called) — the test inserts genuine
-	// alert rows rather than fabricating IDs.
-	insertAlert := func(severity, title, description string) Alert {
+	insertAlert := func(severity, title, description string) AlertRef {
 		var id string
 		err := pool.QueryRow(ctx,
 			`INSERT INTO alerts (organization_id, machine_id, severity, title, description, dedupe_key)
@@ -81,26 +76,22 @@ func TestIncidentLifecycleAgainstRealPostgres(t *testing.T) {
 		if err != nil {
 			t.Fatalf("insert test alert %q: %v", title, err)
 		}
-		return Alert{ID: id, OrganizationID: orgID, Severity: severity, MachineID: machineID, Title: title, Description: description}
+		return AlertRef{ID: id, OrganizationID: orgID, Severity: severity, MachineID: machineID, Title: title, Description: description}
 	}
 
 	alert := insertAlert("HIGH", "Test alert", "test description")
-	incidentID, created, err := incidents.openOrAttach(ctx, alert)
+	incidentID, created, err := store.OpenOrAttach(ctx, alert)
 	if err != nil {
-		t.Fatalf("openOrAttach (first): %v", err)
+		t.Fatalf("OpenOrAttach (first): %v", err)
 	}
 	if !created {
 		t.Fatal("expected the first alert for this machine to create a new incident")
 	}
 
-	// A second alert for the SAME machine must attach, not create another
-	// incident — this is the "don't create unlimited incidents from
-	// repeated alerts" requirement, enforced by the DB constraint, not just
-	// application logic.
 	alert2 := insertAlert("CRITICAL", "Second alert", "another reading")
-	incidentID2, created2, err := incidents.openOrAttach(ctx, alert2)
+	incidentID2, created2, err := store.OpenOrAttach(ctx, alert2)
 	if err != nil {
-		t.Fatalf("openOrAttach (second): %v", err)
+		t.Fatalf("OpenOrAttach (second): %v", err)
 	}
 	if created2 {
 		t.Fatal("expected the second alert for the same machine to attach to the existing incident, not create a new one")
@@ -109,84 +100,89 @@ func TestIncidentLifecycleAgainstRealPostgres(t *testing.T) {
 		t.Fatalf("expected attach to return the same incident id, got %s vs %s", incidentID2, incidentID)
 	}
 
-	var status string
-	if err := pool.QueryRow(ctx, `SELECT status FROM incidents WHERE id = $1`, incidentID).Scan(&status); err != nil {
-		t.Fatalf("query incident status: %v", err)
+	inc, err := store.Get(ctx, orgID, incidentID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
 	}
-	if status != "OPEN" {
-		t.Fatalf("expected new incident status OPEN, got %s", status)
+	if inc.Status != "OPEN" {
+		t.Fatalf("expected new incident status OPEN, got %s", inc.Status)
 	}
 
-	// Invalid transition should be rejected without mutating anything.
-	if err := incidents.transition(ctx, incidentID, "CLOSED", nil, "skip straight to closed"); err == nil {
+	// Cross-tenant Get must behave as not-found.
+	if _, err := store.Get(ctx, "00000000-0000-0000-0000-000000000000", incidentID); err == nil {
+		t.Fatal("expected Get with the wrong organization_id to fail as not-found")
+	}
+
+	if err := store.Transition(ctx, incidentID, "CLOSED", nil, "skip straight to closed"); err == nil {
 		t.Fatal("expected OPEN -> CLOSED to be rejected as an invalid transition")
 	}
 
-	if err := incidents.transition(ctx, incidentID, "ACKNOWLEDGED", nil, "ack'd by test"); err != nil {
+	if err := store.Transition(ctx, incidentID, "ACKNOWLEDGED", nil, "ack'd by test"); err != nil {
 		t.Fatalf("transition to ACKNOWLEDGED: %v", err)
 	}
-	if err := incidents.assign(ctx, incidentID, technicianID, nil); err != nil {
+	if err := store.Assign(ctx, incidentID, technicianID, nil); err != nil {
 		t.Fatalf("assign: %v", err)
 	}
-	if err := incidents.transition(ctx, incidentID, "INVESTIGATING", nil, "looking into it"); err != nil {
+	if err := store.Transition(ctx, incidentID, "INVESTIGATING", nil, "looking into it"); err != nil {
 		t.Fatalf("transition to INVESTIGATING: %v", err)
 	}
-	if err := incidents.resolve(ctx, incidentID, "root cause found and fixed", nil); err != nil {
+	if err := store.Resolve(ctx, incidentID, "root cause found and fixed", nil); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
 
-	var resolvedAt *time.Time
-	var assignedTo, resolutionNotes string
-	if err := pool.QueryRow(ctx, `SELECT resolved_at, assigned_to, resolution_notes FROM incidents WHERE id = $1`, incidentID).
-		Scan(&resolvedAt, &assignedTo, &resolutionNotes); err != nil {
-		t.Fatalf("query resolved incident: %v", err)
+	resolved, err := store.Get(ctx, orgID, incidentID)
+	if err != nil {
+		t.Fatalf("Get after resolve: %v", err)
 	}
-	if resolvedAt == nil {
-		t.Error("expected resolved_at to be set after resolve()")
+	if resolved.ResolvedAt == nil {
+		t.Error("expected resolved_at to be set after Resolve()")
 	}
-	if assignedTo != technicianID {
-		t.Errorf("assigned_to = %q, want %q", assignedTo, technicianID)
+	if resolved.AssignedTo != technicianID {
+		t.Errorf("AssignedTo = %q, want %q", resolved.AssignedTo, technicianID)
 	}
-	if resolutionNotes != "root cause found and fixed" {
-		t.Errorf("resolution_notes = %q, want the resolve() note", resolutionNotes)
+	if resolved.ResolutionNotes != "root cause found and fixed" {
+		t.Errorf("ResolutionNotes = %q, want the resolve() note", resolved.ResolutionNotes)
 	}
 
-	// A recurrence can reopen a resolved incident back to INVESTIGATING...
-	if err := incidents.transition(ctx, incidentID, "INVESTIGATING", nil, "recurred"); err != nil {
+	if err := store.Transition(ctx, incidentID, "INVESTIGATING", nil, "recurred"); err != nil {
 		t.Fatalf("reopen to INVESTIGATING: %v", err)
 	}
-	if err := incidents.transition(ctx, incidentID, "RESOLVED", nil, "fixed for real this time"); err != nil {
+	if err := store.Transition(ctx, incidentID, "RESOLVED", nil, "fixed for real this time"); err != nil {
 		t.Fatalf("re-resolve: %v", err)
 	}
-	// ...and once CLOSED, it's terminal.
-	if err := incidents.transition(ctx, incidentID, "CLOSED", nil, "closing out"); err != nil {
+	if err := store.Transition(ctx, incidentID, "CLOSED", nil, "closing out"); err != nil {
 		t.Fatalf("transition to CLOSED: %v", err)
 	}
-	if err := incidents.transition(ctx, incidentID, "INVESTIGATING", nil, "should fail"); err == nil {
+	if err := store.Transition(ctx, incidentID, "INVESTIGATING", nil, "should fail"); err == nil {
 		t.Fatal("expected CLOSED to be terminal — no transition should succeed from it")
 	}
 
-	// The full audit trail should be present in incident_events.
-	var eventCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM incident_events WHERE incident_id = $1`, incidentID).Scan(&eventCount); err != nil {
-		t.Fatalf("count incident_events: %v", err)
+	events, err := store.ListEvents(ctx, incidentID)
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
 	}
 	// open, attach, ack, assign, investigate, resolve, reopen, re-resolve, close = 9
-	if eventCount != 9 {
-		t.Errorf("expected 9 audit events for the full lifecycle, got %d", eventCount)
+	if len(events) != 9 {
+		t.Errorf("expected 9 audit events for the full lifecycle, got %d", len(events))
 	}
 
-	// A NEW alert after closure should open a fresh incident, not reuse the
-	// closed one — closed incidents are terminal, per the state machine.
 	alert3 := insertAlert("WARNING", "Third alert", "recurrence after closure")
-	incidentID3, created3, err := incidents.openOrAttach(ctx, alert3)
+	incidentID3, created3, err := store.OpenOrAttach(ctx, alert3)
 	if err != nil {
-		t.Fatalf("openOrAttach (after closure): %v", err)
+		t.Fatalf("OpenOrAttach (after closure): %v", err)
 	}
 	if !created3 {
 		t.Fatal("expected a new incident after the previous one closed")
 	}
 	if incidentID3 == incidentID {
 		t.Fatal("expected a genuinely new incident id, not the closed one")
+	}
+
+	list, err := store.List(ctx, orgID, "", 10, 0)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(list) != 2 { // the closed one + the new one from alert3
+		t.Errorf("expected 2 incidents in List, got %d", len(list))
 	}
 }

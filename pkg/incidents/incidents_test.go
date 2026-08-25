@@ -1,4 +1,4 @@
-package main
+package incidents
 
 import "testing"
 
@@ -14,7 +14,7 @@ func TestIsValidTransitionAllowsDocumentedPaths(t *testing.T) {
 		{"RESOLVED", "INVESTIGATING"}, // reopen a recurrence
 	}
 	for _, c := range cases {
-		if !isValidTransition(c.from, c.to) {
+		if !IsValidTransition(c.from, c.to) {
 			t.Errorf("expected %s -> %s to be a valid transition", c.from, c.to)
 		}
 	}
@@ -22,14 +22,14 @@ func TestIsValidTransitionAllowsDocumentedPaths(t *testing.T) {
 
 func TestIsValidTransitionRejectsInvalidPaths(t *testing.T) {
 	cases := []struct{ from, to string }{
-		{"CLOSED", "OPEN"}, // terminal state, no way back
+		{"CLOSED", "OPEN"},
 		{"CLOSED", "RESOLVED"},
-		{"OPEN", "CLOSED"},           // must resolve first
-		{"RESOLVED", "ACKNOWLEDGED"}, // can only reopen to INVESTIGATING, not back to ACKNOWLEDGED
-		{"INVESTIGATING", "OPEN"},    // no going backward
+		{"OPEN", "CLOSED"},
+		{"RESOLVED", "ACKNOWLEDGED"},
+		{"INVESTIGATING", "OPEN"},
 	}
 	for _, c := range cases {
-		if isValidTransition(c.from, c.to) {
+		if IsValidTransition(c.from, c.to) {
 			t.Errorf("expected %s -> %s to be rejected", c.from, c.to)
 		}
 	}

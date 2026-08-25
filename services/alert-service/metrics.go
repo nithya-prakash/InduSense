@@ -28,7 +28,17 @@ var (
 
 	metricIncidentsOpen = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "incidents_open_total",
-		Help: "Currently open alerts (proxy for open incidents until Phase 8 adds incident records).",
+		Help: "Currently open (non-terminal) incidents.",
+	})
+
+	metricIncidentsCreated = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "incidents_created_total",
+		Help: "New incidents opened from an alert.",
+	})
+
+	metricAlertsAttachedToIncident = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "alerts_attached_to_incident_total",
+		Help: "Alerts attached to an already-open incident instead of creating a new one.",
 	})
 
 	metricNotificationSent = promauto.NewCounterVec(prometheus.CounterOpts{

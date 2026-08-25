@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 7 of 18 (Alerting) complete.** This README will be
+> **Status: Phase 8 of 18 (Incidents) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -354,13 +354,47 @@ the alert engine.
 curl localhost:8084/metrics   # alerts_generated_total{severity}, alerts_suppressed_total{reason}, alerts_escalated_total, notifications_sent_total{provider}
 ```
 
-Not yet built: incidents (Phase 8), auth/RBAC
+## Current status (Phase 8 — Incidents)
+
+Incident lifecycle management lives inside `alert-service`
+([incidents.go](services/alert-service/incidents.go)) rather than as a
+separate "incident-service" — incidents originate 1:1 from alerts and there
+was no independent workflow to justify a new microservice yet (the spec's
+own service list doesn't name one either). The manual lifecycle actions
+(acknowledge, assign, resolve, close) are implemented and fully tested now
+so Phase 10's REST API can call them directly once there's a human operator
+to invoke them — this phase proves the state machine and persistence are
+correct ahead of the API surface that will expose them.
+
+**"Don't create unlimited incidents from repeated alerts"** is enforced at
+the database level, not just in application code: `openOrAttach` reuses any
+incident already active for a machine (`INSERT ... ON CONFLICT (machine_id)
+WHERE status IN (...) DO NOTHING`, racing safely against the same partial
+unique index from Phase 2) and logs a fresh alert as an `ALERT_ATTACHED`
+audit event instead of opening a second incident. Verified live: 7 real
+alerts from a fresh traffic burst produced exactly 6 incidents, with 1
+correctly attached rather than duplicated — confirmed directly in Postgres
+with zero machines ever holding more than one active incident.
+
+**State machine** (`OPEN → ACKNOWLEDGED/INVESTIGATING/RESOLVED → CLOSED`,
+with `RESOLVED → INVESTIGATING` allowed for a recurrence but `CLOSED`
+terminal) is unit-tested for every valid and invalid transition, then
+exercised end-to-end against a real Postgres instance in
+[incidents_live_test.go](services/alert-service/incidents_live_test.go) —
+open, attach, acknowledge, assign, investigate, resolve, reopen, re-resolve,
+close, and verifying a post-closure alert opens a genuinely new incident.
+That test caught two real foreign-key constraints the hard way (an
+`incidents.alert_id` and `assigned_to` must reference *real* `alerts`/
+`users` rows, not placeholder strings) — the schema's referential integrity
+doing exactly its job.
+
+Not yet built: auth/RBAC
 enforcement, REST/WS API, frontend, Grafana/Jaeger, Kubernetes manifests,
 CI/CD, and most formal testing (tests so far are unit tests for pure logic
-in the simulator, ingestion, stream-processor, anomaly-detector, and
-alert-service — the live MQTT/Kafka/Redis/InfluxDB/Postgres verification
-above was done manually against real infra, not yet captured as a permanent
-automated test; that lands in Phase 13). These land in Phases 8–18.
+plus the incident lifecycle's live-Postgres test — the rest of the live
+MQTT/Kafka/Redis/InfluxDB/Postgres verification across services was done
+manually against real infra, not yet captured as a permanent automated
+test; that lands in Phase 13). These land in Phases 9–18.
 
 ## Local setup
 

@@ -45,6 +45,7 @@ func main() {
 	go runRuleRefresher(ctx, cfg, rules)
 
 	store := newAlertStore(pool)
+	incidents := newIncidentStore(pool)
 	counter := newAnomalyCountTracker()
 	kio := newKafkaIO(cfg)
 	defer kio.close()
@@ -53,6 +54,7 @@ func main() {
 	log.Printf("alert-service: notification providers: %v", providerNames(providers))
 
 	go runEscalationSweeper(ctx, cfg, store, kio, providers)
+	go runIncidentGaugeRefresher(ctx, pool)
 
 	startHealthServer(cfg.HTTPPort)
 	log.Printf("alert-service: health/metrics server listening on :%s", cfg.HTTPPort)
@@ -61,11 +63,11 @@ func main() {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		consumeAnomalies(ctx, cfg, kio, rules, store, counter, providers)
+		consumeAnomalies(ctx, cfg, kio, rules, store, incidents, counter, providers)
 	}()
 	go func() {
 		defer wg.Done()
-		consumeDeviceEvents(ctx, cfg, kio, rules, store, providers)
+		consumeDeviceEvents(ctx, cfg, kio, rules, store, incidents, providers)
 	}()
 
 	log.Printf("alert-service: consuming %s and %s as group %s", cfg.TopicAnomalies, cfg.TopicDeviceEvents, cfg.ConsumerGroupID)
@@ -107,7 +109,7 @@ func runRuleRefresher(ctx context.Context, cfg Config, rules *ruleCache) {
 	}
 }
 
-func consumeAnomalies(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, counter *anomalyCountTracker, providers []NotificationProvider) {
+func consumeAnomalies(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, incidents *incidentStore, counter *anomalyCountTracker, providers []NotificationProvider) {
 	for {
 		msg, err := kio.anomalyReader.FetchMessage(ctx)
 		if err != nil {
@@ -118,7 +120,7 @@ func consumeAnomalies(ctx context.Context, cfg Config, kio *kafkaIO, rules *rule
 			continue
 		}
 
-		shouldCommit := processAnomaly(ctx, cfg, kio, rules, store, counter, providers, msg)
+		shouldCommit := processAnomaly(ctx, cfg, kio, rules, store, incidents, counter, providers, msg)
 		if shouldCommit {
 			if err := kio.anomalyReader.CommitMessages(ctx, msg); err != nil {
 				log.Printf("alert-service: anomaly commit failed for offset %d: %v", msg.Offset, err)
@@ -127,7 +129,7 @@ func consumeAnomalies(ctx context.Context, cfg Config, kio *kafkaIO, rules *rule
 	}
 }
 
-func processAnomaly(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, counter *anomalyCountTracker, providers []NotificationProvider, msg kafka.Message) bool {
+func processAnomaly(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, incidents *incidentStore, counter *anomalyCountTracker, providers []NotificationProvider, msg kafka.Message) bool {
 	metricAnomaliesConsumed.Inc()
 
 	var anomaly events.AnomalyDetected
@@ -172,7 +174,7 @@ func processAnomaly(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCa
 		switch result {
 		case resultCreated:
 			metricAlertsGenerated.WithLabelValues(created.Severity).Inc()
-			metricIncidentsOpen.Inc()
+			openOrAttachIncident(ctx, incidents, created)
 			publishAndNotify(ctx, kio, providers, created, rule.ID, events.AlertEventCreated, false)
 		case resultSuppressedOpen:
 			metricAlertsSuppressed.WithLabelValues("open").Inc()
@@ -184,7 +186,7 @@ func processAnomaly(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCa
 	return true
 }
 
-func consumeDeviceEvents(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, providers []NotificationProvider) {
+func consumeDeviceEvents(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, incidents *incidentStore, providers []NotificationProvider) {
 	for {
 		msg, err := kio.eventsReader.FetchMessage(ctx)
 		if err != nil {
@@ -195,7 +197,7 @@ func consumeDeviceEvents(ctx context.Context, cfg Config, kio *kafkaIO, rules *r
 			continue
 		}
 
-		shouldCommit := processDeviceEvent(ctx, cfg, kio, rules, store, providers, msg)
+		shouldCommit := processDeviceEvent(ctx, cfg, kio, rules, store, incidents, providers, msg)
 		if shouldCommit {
 			if err := kio.eventsReader.CommitMessages(ctx, msg); err != nil {
 				log.Printf("alert-service: device event commit failed for offset %d: %v", msg.Offset, err)
@@ -204,7 +206,7 @@ func consumeDeviceEvents(ctx context.Context, cfg Config, kio *kafkaIO, rules *r
 	}
 }
 
-func processDeviceEvent(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, providers []NotificationProvider, msg kafka.Message) bool {
+func processDeviceEvent(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, incidents *incidentStore, providers []NotificationProvider, msg kafka.Message) bool {
 	var evt events.NormalizedMachineEvent
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
 		metricMessagesFailed.WithLabelValues("unmarshal").Inc()
@@ -241,7 +243,7 @@ func processDeviceEvent(ctx context.Context, cfg Config, kio *kafkaIO, rules *ru
 	switch result {
 	case resultCreated:
 		metricAlertsGenerated.WithLabelValues(created.Severity).Inc()
-		metricIncidentsOpen.Inc()
+		openOrAttachIncident(ctx, incidents, created)
 		publishAndNotify(ctx, kio, providers, created, rule.ID, events.AlertEventCreated, false)
 	case resultSuppressedOpen:
 		metricAlertsSuppressed.WithLabelValues("open").Inc()
@@ -249,6 +251,42 @@ func processDeviceEvent(ctx context.Context, cfg Config, kio *kafkaIO, rules *ru
 		metricAlertsSuppressed.WithLabelValues("cooldown").Inc()
 	}
 	return true
+}
+
+// openOrAttachIncident links a newly-created alert to an incident, logging
+// but not failing message processing on error — an incident-linkage
+// failure shouldn't cause an already-durably-recorded alert to be redelivered.
+func openOrAttachIncident(ctx context.Context, incidents *incidentStore, alert Alert) {
+	incidentID, created, err := incidents.openOrAttach(ctx, alert)
+	if err != nil {
+		log.Printf("alert-service: failed to link alert %s to an incident: %v", alert.ID, err)
+		return
+	}
+	if created {
+		metricIncidentsCreated.Inc()
+		log.Printf("alert-service: opened incident %s from alert %s", incidentID, alert.ID)
+	} else {
+		metricAlertsAttachedToIncident.Inc()
+		log.Printf("alert-service: attached alert %s to existing incident %s", alert.ID, incidentID)
+	}
+}
+
+func runIncidentGaugeRefresher(ctx context.Context, pool *pgxpool.Pool) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			var count float64
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM incidents WHERE status NOT IN ('RESOLVED', 'CLOSED')`).Scan(&count); err != nil {
+				log.Printf("alert-service: incident gauge refresh failed: %v", err)
+				continue
+			}
+			metricIncidentsOpen.Set(count)
+		}
+	}
 }
 
 func runEscalationSweeper(ctx context.Context, cfg Config, store *alertStore, kio *kafkaIO, providers []NotificationProvider) {

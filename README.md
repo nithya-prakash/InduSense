@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 8 of 18 (Incidents) complete.** This README will be
+> **Status: Phase 9 of 18 (Authentication) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -388,13 +388,57 @@ That test caught two real foreign-key constraints the hard way (an
 `users` rows, not placeholder strings) — the schema's referential integrity
 doing exactly its job.
 
-Not yet built: auth/RBAC
-enforcement, REST/WS API, frontend, Grafana/Jaeger, Kubernetes manifests,
+## Current status (Phase 9 — Authentication)
+
+[pkg/auth](pkg/auth/) implements password hashing, JWT issuance/validation,
+RBAC, and multi-tenancy guards as domain logic with no HTTP dependency —
+same pattern as Phases 7–8: build and live-verify the logic before the
+REST API (Phase 10) exists to expose it. [pkg/audit](pkg/audit/) is a small
+shared writer for the `audit_logs` table, used by `pkg/auth` today and
+available to any service later.
+
+**RBAC is claims-based, not a database lookup per request**: `Login`
+resolves a user's roles to their full permission set (`RolePermissions` in
+[rbac.go](pkg/auth/rbac.go)) and embeds it directly in the JWT, so
+authorizing a request only requires validating the token, not a
+`role_permissions` join on every call. That same map is also the single
+source of truth the seed script uses to populate `role_permissions` in
+Postgres — verified live to match exactly: ADMIN 11 permissions,
+FACTORY_MANAGER 9, ENGINEER 8, TECHNICIAN 6, VIEWER 5.
+
+**The full auth flow was verified against real Postgres and Redis**, not
+mocked, in [service_live_test.go](pkg/auth/service_live_test.go): login
+with the real seeded admin user, wrong-password and unknown-email
+rejection, refresh-token **rotation** (each refresh both invalidates the
+presented token and issues a new one), reuse-of-a-rotated-out-token
+rejection, and logout revocation — all checked against Redis state, not
+just the code path. The audit trail was checked directly in Postgres:
+successful logins, failed logins, and logouts all produced real
+`audit_logs` rows.
+
+**Multi-tenancy was verified with two real organizations**, not asserted
+against one: the seed script now creates a second organization ("Zweite
+Firma GmbH") with its own factory and admin user specifically so isolation
+has something concrete to fail against. `TestMultiTenantLoginsAreIsolated`
+confirms both organizations' tokens carry distinct `organization_id`
+claims, that `RequireSameOrganization` rejects org A's token against org
+B's resource, and — as a data-layer ground truth check — that no factory
+row's `organization_id` can appear under a different organization's join.
+
+Access tokens are **not** individually revocable (the standard stateless-
+JWT tradeoff), mitigated by a short TTL (`JWT_ACCESS_TTL_MINUTES`, default
+15) rather than pretending server-side revocation of a bearer token is
+free; refresh tokens are revocable because they're tracked in Redis by
+design.
+
+Not yet built: REST API/WebSockets (Phase 10 — where `pkg/auth` gets wired
+into HTTP middleware), frontend, Grafana/Jaeger, Kubernetes manifests,
 CI/CD, and most formal testing (tests so far are unit tests for pure logic
-plus the incident lifecycle's live-Postgres test — the rest of the live
-MQTT/Kafka/Redis/InfluxDB/Postgres verification across services was done
-manually against real infra, not yet captured as a permanent automated
-test; that lands in Phase 13). These land in Phases 9–18.
+plus live-Postgres/Redis integration tests for incidents and auth — the
+rest of the live MQTT/Kafka/Redis/InfluxDB/Postgres verification across
+services was done manually against real infra, not yet captured as a
+permanent automated test; that lands in Phase 13). These land in
+Phases 10–18.
 
 ## Local setup
 
@@ -409,6 +453,14 @@ make down    # stop everything (data volumes preserved)
 
 Kafka UI: http://localhost:8089
 InfluxDB UI: http://localhost:8086
+
+Demo users (`make seed`), one per role, password `ChangeMe123!` for all —
+**local development only, never used anywhere real credentials would be**:
+`admin@musterfabrik-gmbh.de`, `factory_manager@musterfabrik-gmbh.de`,
+`engineer@musterfabrik-gmbh.de`, `technician@musterfabrik-gmbh.de`,
+`viewer@musterfabrik-gmbh.de`. A second organization
+(`admin@zweite-firma-gmbh.de`, same password) exists specifically for
+multi-tenancy testing.
 
 ## Repository structure
 

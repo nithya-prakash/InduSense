@@ -14,9 +14,11 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nithya-prakash/indusense/pkg/auth"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -133,7 +135,7 @@ func run() error {
 	err = pool.QueryRow(ctx, `SELECT id FROM organizations WHERE slug = $1`, orgSlug).Scan(&existingOrgID)
 	if err == nil {
 		log.Printf("organization %q already seeded (id=%s) — skipping hierarchy, seed is idempotent", orgSlug, existingOrgID)
-		return seedAlertRulesIfMissing(ctx, pool, existingOrgID)
+		return seedSupportingData(ctx, pool, existingOrgID)
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -264,7 +266,24 @@ func run() error {
 	log.Printf("seed complete: %d factories, %d production lines, %d machines, %d devices, %d device credentials, %d sensors",
 		factoryCount, lineCount, machineCount, deviceCount, credCount, sensorCount)
 
-	return seedAlertRulesIfMissing(ctx, pool, orgID)
+	return seedSupportingData(ctx, pool, orgID)
+}
+
+// seedSupportingData seeds everything that isn't part of the core factory
+// hierarchy transaction: alert rules, RBAC roles/permissions, demo users,
+// and a second organization for tenant-isolation testing. Each step is
+// independently idempotent.
+func seedSupportingData(ctx context.Context, pool *pgxpool.Pool, orgID string) error {
+	if err := seedAlertRulesIfMissing(ctx, pool, orgID); err != nil {
+		return err
+	}
+	if err := seedRBACIfMissing(ctx, pool); err != nil {
+		return err
+	}
+	if err := seedUsersIfMissing(ctx, pool, orgID); err != nil {
+		return err
+	}
+	return seedSecondOrganizationIfMissing(ctx, pool)
 }
 
 // seedAlertRulesIfMissing inserts a handful of representative,
@@ -321,3 +340,179 @@ func seedAlertRulesIfMissing(ctx context.Context, pool *pgxpool.Pool, orgID stri
 }
 
 func ptr(f float64) *float64 { return &f }
+
+var permissionDescriptions = map[string]string{
+	auth.PermDevicesRead:     "View device inventory and status",
+	auth.PermDevicesWrite:    "Provision, update, and decommission devices",
+	auth.PermTelemetryRead:   "View sensor telemetry and historical readings",
+	auth.PermAlertsRead:      "View alerts",
+	auth.PermAlertsManage:    "Acknowledge, suppress, and configure alert rules",
+	auth.PermIncidentsRead:   "View incidents",
+	auth.PermIncidentsManage: "Assign, transition, and resolve incidents",
+	auth.PermFactoriesRead:   "View factories, production lines, and machines",
+	auth.PermFactoriesManage: "Create and modify factories, production lines, and machines",
+	auth.PermUsersManage:     "Create users and modify role assignments",
+	auth.PermSystemAdmin:     "Full administrative access, including platform configuration",
+}
+
+// seedRBACIfMissing seeds roles, permissions, and role_permissions directly
+// from auth.RolePermissions (pkg/auth/rbac.go) — the same map the runtime
+// uses to resolve a logged-in user's permissions — so this reference table
+// can never drift from what's actually enforced.
+func seedRBACIfMissing(ctx context.Context, pool *pgxpool.Pool) error {
+	var existing int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM roles`).Scan(&existing); err != nil {
+		return fmt.Errorf("check existing roles: %w", err)
+	}
+	if existing > 0 {
+		log.Printf("roles already seeded — skipping RBAC seed, seed is idempotent")
+		return nil
+	}
+
+	roleIDs := make(map[string]string, len(auth.AllRoles))
+	for _, role := range auth.AllRoles {
+		var id string
+		if err := pool.QueryRow(ctx, `INSERT INTO roles (name, description) VALUES ($1, $2) RETURNING id`,
+			role, "Seeded role: "+role).Scan(&id); err != nil {
+			return fmt.Errorf("insert role %s: %w", role, err)
+		}
+		roleIDs[role] = id
+	}
+
+	permIDs := make(map[string]string, len(permissionDescriptions))
+	for code, desc := range permissionDescriptions {
+		var id string
+		if err := pool.QueryRow(ctx, `INSERT INTO permissions (code, description) VALUES ($1, $2) RETURNING id`,
+			code, desc).Scan(&id); err != nil {
+			return fmt.Errorf("insert permission %s: %w", code, err)
+		}
+		permIDs[code] = id
+	}
+
+	for role, perms := range auth.RolePermissions {
+		for _, perm := range perms {
+			if _, err := pool.Exec(ctx, `INSERT INTO role_permissions (role_id, permission_id) VALUES ($1, $2)`,
+				roleIDs[role], permIDs[perm]); err != nil {
+				return fmt.Errorf("link role %s to permission %s: %w", role, perm, err)
+			}
+		}
+	}
+
+	log.Printf("seeded %d roles, %d permissions, %d role_permissions links", len(roleIDs), len(permIDs), sumRolePermissionCounts())
+	return nil
+}
+
+func sumRolePermissionCounts() int {
+	n := 0
+	for _, perms := range auth.RolePermissions {
+		n += len(perms)
+	}
+	return n
+}
+
+// demoPassword is the local-development-only password for every seeded
+// demo user. It is not a secret — this is throwaway data for a local
+// Docker Compose environment, documented in the README, never used
+// anywhere real credentials would be.
+const demoPassword = "ChangeMe123!"
+
+// seedUsersIfMissing creates one demo user per role, scoped to orgID, with
+// a bcrypt-hashed password (never storing the plaintext) and the
+// corresponding user_roles link.
+func seedUsersIfMissing(ctx context.Context, pool *pgxpool.Pool, orgID string) error {
+	var existing int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM users WHERE organization_id = $1`, orgID).Scan(&existing); err != nil {
+		return fmt.Errorf("check existing users: %w", err)
+	}
+	if existing > 0 {
+		log.Printf("organization already has %d user(s) — skipping user seed, seed is idempotent", existing)
+		return nil
+	}
+
+	if err := auth.ValidatePasswordStrength(demoPassword); err != nil {
+		return fmt.Errorf("demo password fails strength validation: %w", err)
+	}
+	hash, err := auth.HashPassword(demoPassword)
+	if err != nil {
+		return fmt.Errorf("hash demo password: %w", err)
+	}
+
+	for _, role := range auth.AllRoles {
+		email := strings.ToLower(role) + "@musterfabrik-gmbh.de"
+		fullName := "Demo " + strings.Title(strings.ToLower(strings.ReplaceAll(role, "_", " "))) //nolint:staticcheck // simple display name, not locale-sensitive
+
+		var userID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users (organization_id, email, password_hash, full_name) VALUES ($1, $2, $3, $4) RETURNING id`,
+			orgID, email, hash, fullName,
+		).Scan(&userID); err != nil {
+			return fmt.Errorf("insert demo user for role %s: %w", role, err)
+		}
+
+		var roleID string
+		if err := pool.QueryRow(ctx, `SELECT id FROM roles WHERE name = $1`, role).Scan(&roleID); err != nil {
+			return fmt.Errorf("look up role id for %s: %w", role, err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)`, userID, roleID); err != nil {
+			return fmt.Errorf("link user to role %s: %w", role, err)
+		}
+	}
+
+	log.Printf("seeded %d demo users (one per role), password %q — LOCAL DEV ONLY", len(auth.AllRoles), demoPassword)
+	return nil
+}
+
+// seedSecondOrganizationIfMissing creates a second, minimal organization so
+// multi-tenancy has something real to isolate against — tests and manual
+// verification can prove Organization A's data is invisible to
+// Organization B's users, rather than that claim being untestable because
+// only one organization exists.
+func seedSecondOrganizationIfMissing(ctx context.Context, pool *pgxpool.Pool) error {
+	const slug = "zweite-firma-gmbh"
+
+	var existingID string
+	err := pool.QueryRow(ctx, `SELECT id FROM organizations WHERE slug = $1`, slug).Scan(&existingID)
+	if err == nil {
+		log.Printf("second organization %q already seeded — skipping, seed is idempotent", slug)
+		return nil
+	}
+
+	var orgID string
+	if err := pool.QueryRow(ctx, `INSERT INTO organizations (name, slug) VALUES ('Zweite Firma GmbH', $1) RETURNING id`, slug).Scan(&orgID); err != nil {
+		return fmt.Errorf("insert second organization: %w", err)
+	}
+
+	var factoryID string
+	if err := pool.QueryRow(ctx, `INSERT INTO factories (organization_id, name, city) VALUES ($1, 'Stuttgart Plant', 'Stuttgart') RETURNING id`, orgID).Scan(&factoryID); err != nil {
+		return fmt.Errorf("insert second org factory: %w", err)
+	}
+	var lineID string
+	if err := pool.QueryRow(ctx, `INSERT INTO production_lines (factory_id, name) VALUES ($1, 'Line 01') RETURNING id`, factoryID).Scan(&lineID); err != nil {
+		return fmt.Errorf("insert second org production line: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO machines (production_line_id, name, machine_type) VALUES ($1, 'Stuttgart-Line01-M001', 'CNC_MILLING_MACHINE')`, lineID); err != nil {
+		return fmt.Errorf("insert second org machine: %w", err)
+	}
+
+	hash, err := auth.HashPassword(demoPassword)
+	if err != nil {
+		return fmt.Errorf("hash demo password: %w", err)
+	}
+	var adminUserID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO users (organization_id, email, password_hash, full_name) VALUES ($1, 'admin@zweite-firma-gmbh.de', $2, 'Demo Admin') RETURNING id`,
+		orgID, hash,
+	).Scan(&adminUserID); err != nil {
+		return fmt.Errorf("insert second org admin user: %w", err)
+	}
+	var adminRoleID string
+	if err := pool.QueryRow(ctx, `SELECT id FROM roles WHERE name = $1`, auth.RoleAdmin).Scan(&adminRoleID); err != nil {
+		return fmt.Errorf("look up ADMIN role id: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)`, adminUserID, adminRoleID); err != nil {
+		return fmt.Errorf("link second org admin to ADMIN role: %w", err)
+	}
+
+	log.Printf("seeded second organization %q for tenant-isolation testing (org_id=%s)", slug, orgID)
+	return nil
+}

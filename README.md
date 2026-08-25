@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 1 of 18 (Foundation) complete.** This README will be
+> **Status: Phase 2 of 18 (Domain) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -91,10 +91,40 @@ Telemetry topics are partitioned by `device_id` (to be enforced by the
 ingestion service in Phase 4) so that events for a given device are strictly
 ordered, while different devices process in parallel across partitions.
 
-Not yet built: domain models/migrations, sensor simulator, ingestion service,
-stream processor, anomaly detection, alerting, incidents, auth/RBAC, REST/WS
-API, frontend, observability stack, Kubernetes manifests, CI/CD, and testing.
-These land in Phases 2–18.
+## Current status (Phase 2 — Domain)
+
+19 PostgreSQL tables created via 8 [golang-migrate](https://github.com/golang-migrate/migrate)
+migrations in [migrations/](migrations/): the factory hierarchy
+(`organizations` → `factories` → `production_lines` → `machines` → `devices`
+→ `sensors`), auth/RBAC scaffolding (`users`, `roles`, `permissions`,
+`role_permissions`, `user_roles` — populated in Phase 9), `device_credentials`,
+`alert_rules`/`alerts`, `incidents`/`incident_events`, `maintenance_records`,
+`audit_logs`, and `idempotency_keys`. 60 indexes/constraints total, including
+partial-unique indexes enforcing "one active credential per device" and "one
+active incident per machine" at the database level.
+
+[scripts/seed](scripts/seed/main.go) seeds a realistic hierarchy — one
+organization ("Musterfabrik GmbH") across 4 German factories (Berlin,
+Dresden, Munich, Hamburg), each with 5 production lines of 10 machines drawn
+from 5 realistic industrial machine profiles (CNC mill, hydraulic press,
+conveyor belt, welding robot, air compressor), each machine with one
+provisioned device and 5 sensors — **1000 sensors total**, verified by
+running the seed against live Postgres. The seed is idempotent (checks for
+an existing organization slug) and transactional (a mid-seed failure leaves
+zero partial rows, verified by injecting a duplicate-key failure). Device
+credentials are bcrypt-hashed before storage — the plaintext secret exists
+only transiently in memory during provisioning.
+
+```bash
+make migrate-up    # apply migrations
+make seed          # seed the factory hierarchy
+make unit-test     # go test ./...
+```
+
+Not yet built: sensor simulator, ingestion service, stream processor,
+anomaly detection, alerting, incidents, auth/RBAC enforcement, REST/WS API,
+frontend, observability stack, Kubernetes manifests, CI/CD, and most testing.
+These land in Phases 3–18.
 
 ## Local setup
 

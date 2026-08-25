@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS sensors;
+DROP TABLE IF EXISTS devices;
+DROP TABLE IF EXISTS machines;
+DROP TABLE IF EXISTS production_lines;
+DROP TABLE IF EXISTS factories;
+DROP TABLE IF EXISTS organizations;

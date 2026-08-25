@@ -3,7 +3,22 @@ COMPOSE := docker compose
 
 .PHONY: setup up down logs ps restart clean \
         lint test unit-test integration-test contract-test e2e-test \
-        seed simulate load-test demo fmt vet
+        seed simulate load-test demo fmt vet migrate-up migrate-down
+
+MIGRATE_IMAGE := migrate/migrate:v4.17.1
+POSTGRES_DSN := postgres://indusense:indusense_dev_password@postgres:5432/indusense?sslmode=disable
+
+## migrate-up: apply all pending Postgres migrations
+migrate-up:
+	docker run --rm --network indusense_indusense-net \
+		-v "$$(pwd)/migrations:/migrations" $(MIGRATE_IMAGE) \
+		-path=/migrations -database "$(POSTGRES_DSN)" up
+
+## migrate-down: roll back the most recent migration
+migrate-down:
+	docker run --rm --network indusense_indusense-net \
+		-v "$$(pwd)/migrations:/migrations" $(MIGRATE_IMAGE) \
+		-path=/migrations -database "$(POSTGRES_DSN)" down 1
 
 ## setup: copy .env.example to .env if missing
 setup:
@@ -67,7 +82,7 @@ e2e-test:
 
 ## seed: seed organizations/factories/machines/devices/sensors into Postgres
 seed:
-	@echo "NOT YET IMPLEMENTED — added in Phase 2 (Domain)"
+	SEED_POSTGRES_DSN="postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable" go run ./scripts/seed
 
 ## simulate: run the sensor simulator against MQTT
 simulate:

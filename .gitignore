@@ -1,0 +1,25 @@
+.env
+*.log
+
+# Go
+/bin/
+*.test
+*.out
+vendor/
+
+# Node / frontend
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Docker / data volumes mounted locally (none expected, safety net)
+*.pid
+
+# Local scratch
+tmp/

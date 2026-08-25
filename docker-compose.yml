@@ -180,6 +180,43 @@ services:
     logging: *default-logging
     networks: [indusense-net]
 
+  stream-processor:
+    build:
+      context: .
+      dockerfile: services/stream-processor/Dockerfile
+    container_name: indusense-stream-processor
+    ports:
+      - "8082:8082"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CONSUMER_GROUP_PREFIX: ${MQTT_CLIENT_ID_PREFIX:-indusense}
+      KAFKA_TOPIC_TELEMETRY_RAW: ${KAFKA_TOPIC_TELEMETRY_RAW:-telemetry.raw}
+      KAFKA_TOPIC_TELEMETRY_PROCESSED: ${KAFKA_TOPIC_TELEMETRY_PROCESSED:-telemetry.processed}
+      KAFKA_TOPIC_DEAD_LETTER: ${KAFKA_TOPIC_DEAD_LETTER:-dead-letter}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      INFLUXDB_URL: http://influxdb:8086
+      INFLUXDB_TOKEN: ${INFLUXDB_TOKEN:-dev-only-influx-admin-token-change-me}
+      INFLUXDB_ORG: ${INFLUXDB_ORG:-indusense}
+      INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-telemetry}
+      STREAM_PROCESSOR_PORT: "8082"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init-topics:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8082/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks: [indusense-net]
+
   # ---------------------------------------------------------------------------
   # Sensor simulator — on-demand only (not part of `docker compose up`).
   # Run with `make simulate` or `docker compose --profile simulate up simulator`.

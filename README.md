@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 12 of 18 (Observability) complete.** This README will be
+> **Status: Phase 13 of 18 (Testing) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -652,6 +652,96 @@ collected by `docker compose logs`; Prometheus alerting rules (Alertmanager)
 only from `alert-service`'s own domain logic; and most `log.Printf` call
 sites outside the lifecycle events above remain unstructured, as noted.
 These, along with Kubernetes manifests and CI/CD, land in Phases 14–18.
+
+## Current status (Phase 13 — Testing)
+
+[Makefile](Makefile)'s `unit-test`/`integration-test`/`contract-test`/`e2e-test`
+targets were scaffolded back in Phase 1 pointing at `tests/integration/`,
+`tests/contract/`, and `tests/e2e/` — this phase is what actually populates
+them, on top of the unit and live-infra tests already written incrementally
+in Phases 1–12 (`pkg/auth`, `pkg/incidents`, and per-service pure-logic
+tests). All four tiers, run together, are what `make test` now covers.
+
+**Contract tests** ([tests/contract/](tests/contract/)) lock the JSON wire
+format of every event type in `pkg/events` — `NormalizedTelemetryEvent`,
+`NormalizedMachineEvent`, `AnomalyDetected`, `AlertEvent`,
+`DeadLetterRecord` — against a fixed expected payload, round-tripped in both
+directions (struct→JSON and back). There's no schema registry or
+consumer-driven-contract framework (Pact) in this stack, so this is a
+narrower, honest substitute: it can't catch "the consumer expected a field
+the producer stopped sending" across a deploy it doesn't have, but it does
+turn "someone renamed `DeviceID` to `Device_Id` in the shared struct" from a
+silent runtime failure in some *other* service into an immediate, local test
+failure. Fast and infra-free by design — no skip logic needed.
+
+**Integration tests** ([tests/integration/](tests/integration/)) hit the
+real running `api` container over HTTP against real Postgres/Redis — not a
+mocked handler test — using the demo data `scripts/seed` already puts there.
+The centerpiece is `TestTenantIsolation_FactoriesScopedToOrganization`: it
+logs in as both seeded organizations' admins for real and asserts
+`zweite-firma-gmbh` never sees `musterfabrik-gmbh`'s factories (or vice
+versa) — proving the "every query scopes by the JWT's `organization_id`"
+claim from Phase 10 against live data, not by re-reading the query.
+Alongside it: RBAC (`VIEWER` gets 403 on `POST /api/v1/devices` before the
+handler body even runs; `ADMIN` reaches business validation instead),
+login success/failure, unauthenticated/malformed-token rejection, and rate
+limiting.
+
+Writing the rate-limit test surfaced a real test-suite bug, not a product
+bug: the login endpoint's limiter buckets by client IP
+(`X-Forwarded-For`-aware), and every test in the package logged in from the
+same test-runner IP — so a test that deliberately exhausts the limit (or
+just two `make test` runs within the same 60s window) made *unrelated*
+tests fail with 429 instead of the status they were actually checking.
+Fixed by giving each test its own synthetic `X-Forwarded-For` (RFC 5737
+TEST-NET-3, never a real address) — confirmed by running the full suite
+twice back to back with no interference, where it previously failed on the
+second run.
+
+**End-to-end tests** ([tests/e2e/](tests/e2e/)) are the ones that actually
+justify an event-driven architecture existing at all: they publish a real
+MQTT message to the same Mosquitto broker ingestion subscribes to, and poll
+the real API until the effect that message should have propagates all the
+way through — nothing mocked, stubbed, or short-circuited anywhere in
+between.
+
+- `TestE2E_TelemetryRoundTrip` looks up a real seeded sensor from Postgres,
+  publishes an in-range reading over MQTT, and polls
+  `GET /api/v1/telemetry/latest` until that exact value comes back —
+  proving MQTT → ingestion → Kafka → stream-processor → InfluxDB → API.
+- `TestE2E_AnomalyTriggersAlert` publishes `temperature=150` (the seeded
+  "High temperature" rule fires above 90) and polls `GET /api/v1/alerts`
+  for the resulting `CRITICAL` alert — proving MQTT → ingestion → Kafka →
+  anomaly-detector's rule check → alert-service's rule match → Postgres →
+  API, the platform's actual reason for existing. Both passed in under a
+  second end to end against the real stack — a genuine (if informal, not a
+  load test) latency data point for Phase 15.
+
+Getting the alert test to run reliably took a second, more interesting
+fix: `zweite-firma-gmbh` (seeded purely for the tenant-isolation test
+above) turned out to have no devices or sensors of its own — only a bare
+factory/machine — so it couldn't be used to publish telemetry at all.
+Rather than reuse a `musterfabrik-gmbh` device that might already be on
+that rule's alert cooldown from earlier simulator runs (which would make
+the test flaky depending on unrelated history), the test picks a device
+dynamically via `NOT EXISTS (SELECT 1 FROM alerts WHERE device_id = ... AND
+title = 'High temperature')` — always a device this specific rule has never
+fired for yet, so there's no cooldown state to race against, and the query
+is naturally self-renewing across repeated runs.
+
+**Not implemented in this phase**: consumer-driven contract testing (Pact
+or similar) — the contract tests here are schema-locking, not full
+consumer-driven contracts; frontend tests (no Jest/Playwright suite yet);
+`go tool cover` coverage numbers for `services/api`/`ingestion`/etc. remain
+low (~3–30%) despite the new integration/E2E coverage, because those tests
+exercise the already-running Docker container over the network — coverage
+instrumentation only counts code paths executed inside the same test
+binary process, so real, meaningful HTTP-level test coverage of the API
+doesn't show up in that number at all. Worth stating plainly rather than
+letting a low percentage look like an untested service, or citing test
+counts as if they meant something they don't. Kubernetes manifests, CI/CD,
+and load testing (Makefile's `load-test` target already names itself
+Phase 15) land in the remaining phases.
 
 ## Local setup
 

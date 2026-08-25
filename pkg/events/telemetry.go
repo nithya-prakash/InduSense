@@ -37,10 +37,11 @@ type NormalizedTelemetryEvent struct {
 // MachineStatusEvent is published on factory/{factory_id}/machine/{machine_id}/status
 // whenever a machine transitions between operating states.
 type MachineStatusEvent struct {
-	FactoryID string    `json:"factory_id"`
-	MachineID string    `json:"machine_id"`
-	Status    string    `json:"status"`
-	Timestamp time.Time `json:"timestamp"`
+	OrganizationID string    `json:"organization_id"`
+	FactoryID      string    `json:"factory_id"`
+	MachineID      string    `json:"machine_id"`
+	Status         string    `json:"status"`
+	Timestamp      time.Time `json:"timestamp"`
 }
 
 // MachineEvent is published on factory/{factory_id}/machine/{machine_id}/events
@@ -48,13 +49,14 @@ type MachineStatusEvent struct {
 // share this shape (a status-topic message sets Status, an events-topic
 // message sets EventType) so ingestion can validate both uniformly.
 type MachineEvent struct {
-	FactoryID string    `json:"factory_id"`
-	MachineID string    `json:"machine_id"`
-	DeviceID  string    `json:"device_id,omitempty"`
-	SensorID  string    `json:"sensor_id,omitempty"`
-	Status    string    `json:"status,omitempty"`
-	EventType string    `json:"event_type,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
+	OrganizationID string    `json:"organization_id"`
+	FactoryID      string    `json:"factory_id"`
+	MachineID      string    `json:"machine_id"`
+	DeviceID       string    `json:"device_id,omitempty"`
+	SensorID       string    `json:"sensor_id,omitempty"`
+	Status         string    `json:"status,omitempty"`
+	EventType      string    `json:"event_type,omitempty"`
+	Timestamp      time.Time `json:"timestamp"`
 }
 
 // NormalizedMachineEvent is what ingestion publishes to device.events.

@@ -132,8 +132,8 @@ func run() error {
 	var existingOrgID string
 	err = pool.QueryRow(ctx, `SELECT id FROM organizations WHERE slug = $1`, orgSlug).Scan(&existingOrgID)
 	if err == nil {
-		log.Printf("organization %q already seeded (id=%s) — skipping, seed is idempotent", orgSlug, existingOrgID)
-		return nil
+		log.Printf("organization %q already seeded (id=%s) — skipping hierarchy, seed is idempotent", orgSlug, existingOrgID)
+		return seedAlertRulesIfMissing(ctx, pool, existingOrgID)
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -263,5 +263,61 @@ func run() error {
 
 	log.Printf("seed complete: %d factories, %d production lines, %d machines, %d devices, %d device credentials, %d sensors",
 		factoryCount, lineCount, machineCount, deviceCount, credCount, sensorCount)
+
+	return seedAlertRulesIfMissing(ctx, pool, orgID)
+}
+
+// seedAlertRulesIfMissing inserts a handful of representative,
+// organization-wide alert rules (scoped by metric only, not to a specific
+// machine/device/sensor) matching the examples from the spec: a hard
+// temperature threshold, a vibration threshold, a power-spike threshold, and
+// an anomaly-count rule ("three anomalies within five minutes"). Idempotent:
+// skipped entirely if this organization already has any alert rules.
+func seedAlertRulesIfMissing(ctx context.Context, pool *pgxpool.Pool, orgID string) error {
+	var existing int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM alert_rules WHERE organization_id = $1`, orgID).Scan(&existing); err != nil {
+		return fmt.Errorf("check existing alert rules: %w", err)
+	}
+	if existing > 0 {
+		log.Printf("organization already has %d alert rule(s) — skipping, seed is idempotent", existing)
+		return nil
+	}
+
+	rules := []struct {
+		name         string
+		metric       string
+		condition    string
+		thresholdVal *float64
+		thresholdMin *float64
+		thresholdMax *float64
+		severity     string
+		cooldownSecs int
+		windowSecs   int
+	}{
+		{name: "High temperature", metric: "temperature", condition: "GREATER_THAN", thresholdVal: ptr(90.0), severity: "CRITICAL", cooldownSecs: 300, windowSecs: 300},
+		{name: "Excessive vibration", metric: "vibration", condition: "GREATER_THAN", thresholdVal: ptr(8.0), severity: "HIGH", cooldownSecs: 180, windowSecs: 300},
+		{name: "Power spike", metric: "power", condition: "GREATER_THAN", thresholdVal: ptr(45.0), severity: "WARNING", cooldownSecs: 180, windowSecs: 300},
+		{name: "Repeated temperature anomalies", metric: "temperature", condition: "ANOMALY_COUNT", thresholdVal: ptr(3.0), severity: "HIGH", cooldownSecs: 300, windowSecs: 300},
+		// Sentinel rule for the alert-service's direct machine-shutdown handler
+		// (services/alert-service/main.go): "machine_status" isn't a real
+		// telemetry metric, so this rule is never matched against sensor
+		// readings — it exists only to give shutdown alerts a stable
+		// alert_rule_id to dedupe/cooldown against.
+		{name: "Unexpected machine shutdown", metric: "machine_status", condition: "ANOMALY_COUNT", thresholdVal: ptr(1.0), severity: "WARNING", cooldownSecs: 300, windowSecs: 300},
+	}
+
+	for _, r := range rules {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO alert_rules (organization_id, name, metric, condition, threshold_value, threshold_min, threshold_max, severity, cooldown_seconds, window_seconds)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			orgID, r.name, r.metric, r.condition, r.thresholdVal, r.thresholdMin, r.thresholdMax, r.severity, r.cooldownSecs, r.windowSecs,
+		)
+		if err != nil {
+			return fmt.Errorf("insert alert rule %q: %w", r.name, err)
+		}
+	}
+	log.Printf("seeded %d alert rules", len(rules))
 	return nil
 }
+
+func ptr(f float64) *float64 { return &f }

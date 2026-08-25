@@ -247,6 +247,37 @@ services:
     logging: *default-logging
     networks: [indusense-net]
 
+  alert-service:
+    build:
+      context: .
+      dockerfile: services/alert-service/Dockerfile
+    container_name: indusense-alert-service
+    ports:
+      - "8084:8084"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CONSUMER_GROUP_PREFIX: ${MQTT_CLIENT_ID_PREFIX:-indusense}
+      KAFKA_TOPIC_ANOMALIES_DETECTED: ${KAFKA_TOPIC_ANOMALIES_DETECTED:-anomalies.detected}
+      KAFKA_TOPIC_DEVICE_EVENTS: ${KAFKA_TOPIC_DEVICE_EVENTS:-device.events}
+      KAFKA_TOPIC_ALERTS: ${KAFKA_TOPIC_ALERTS:-alerts}
+      KAFKA_TOPIC_DEAD_LETTER: ${KAFKA_TOPIC_DEAD_LETTER:-dead-letter}
+      ALERT_POSTGRES_DSN: postgres://${POSTGRES_USER:-indusense}:${POSTGRES_PASSWORD:-indusense_dev_password}@postgres:5432/${POSTGRES_DB:-indusense}?sslmode=disable
+      ALERT_SERVICE_PORT: "8084"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init-topics:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8084/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks: [indusense-net]
+
   # ---------------------------------------------------------------------------
   # Sensor simulator — on-demand only (not part of `docker compose up`).
   # Run with `make simulate` or `docker compose --profile simulate up simulator`.

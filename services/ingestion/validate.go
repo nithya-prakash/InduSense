@@ -54,6 +54,9 @@ func validateTelemetry(e events.TelemetryEvent) error {
 // validateMachineEvent checks a raw status/event message from the
 // factory/{f}/machine/{m}/status or /events topics.
 func validateMachineEvent(e events.MachineEvent) error {
+	if err := requireUUID("organization_id", e.OrganizationID); err != nil {
+		return err
+	}
 	if err := requireUUID("factory_id", e.FactoryID); err != nil {
 		return err
 	}

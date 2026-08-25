@@ -135,7 +135,7 @@ func main() {
 			seenDevices[e.DeviceID] = true
 			deviceToFactoryMachine[e.DeviceID] = [2]string{e.FactoryID, e.MachineID}
 			machineWG.Add(1)
-			go runMachineController(ctx, &machineWG, e.DeviceID, e.FactoryID, e.MachineID,
+			go runMachineController(ctx, &machineWG, e.OrganizationID, e.DeviceID, e.FactoryID, e.MachineID,
 				getMachine(e.DeviceID), enqueue, rand.New(rand.NewSource(time.Now().UnixNano())))
 		}
 	}
@@ -214,13 +214,13 @@ func runSensor(
 			if failed {
 				st.sensorFailed.Add(1)
 				enqueue(eventsTopic, events.MachineEvent{
-					FactoryID: entry.FactoryID, MachineID: entry.MachineID,
+					OrganizationID: entry.OrganizationID, FactoryID: entry.FactoryID, MachineID: entry.MachineID,
 					DeviceID: entry.DeviceID, SensorID: entry.SensorID,
 					EventType: "SENSOR_FAILURE", Timestamp: time.Now().UTC(),
 				})
 			} else {
 				enqueue(eventsTopic, events.MachineEvent{
-					FactoryID: entry.FactoryID, MachineID: entry.MachineID,
+					OrganizationID: entry.OrganizationID, FactoryID: entry.FactoryID, MachineID: entry.MachineID,
 					DeviceID: entry.DeviceID, SensorID: entry.SensorID,
 					EventType: "SENSOR_RECOVERED", Timestamp: time.Now().UTC(),
 				})
@@ -288,7 +288,7 @@ func publishEvent(ctx context.Context, evt events.TelemetryEvent, topic string, 
 func runMachineController(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	deviceID, factoryID, machineID string,
+	organizationID, deviceID, factoryID, machineID string,
 	mc *machineController,
 	enqueue func(topic string, v any),
 	rng *rand.Rand,
@@ -313,11 +313,11 @@ func runMachineController(
 					newStatus = "RUNNING"
 				}
 				enqueue(statusTopic, events.MachineStatusEvent{
-					FactoryID: factoryID, MachineID: machineID,
+					OrganizationID: organizationID, FactoryID: factoryID, MachineID: machineID,
 					Status: newStatus, Timestamp: time.Now().UTC(),
 				})
 				enqueue(eventsTopic, events.MachineEvent{
-					FactoryID: factoryID, MachineID: machineID, DeviceID: deviceID,
+					OrganizationID: organizationID, FactoryID: factoryID, MachineID: machineID, DeviceID: deviceID,
 					EventType: "MACHINE_" + newStatus, Timestamp: time.Now().UTC(),
 				})
 			}

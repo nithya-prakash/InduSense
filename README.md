@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 6 of 18 (Anomaly Detection) complete.** This README will be
+> **Status: Phase 7 of 18 (Alerting) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -296,13 +296,71 @@ curl localhost:8083/forests    # which machine types currently have a trained fo
 curl localhost:8083/metrics    # anomalies_detected_total{method}, isolation_forests_trained_total
 ```
 
-Not yet built: alerting, incidents, auth/RBAC
+## Current status (Phase 7 — Alerting)
+
+[services/alert-service](services/alert-service/) consumes
+`anomalies.detected` and `device.events`, matches events against
+organization-configured `alert_rules` (Postgres), and creates alerts with
+deduplication, cooldown, and escalation — publishing to the `alerts` Kafka
+topic and notifying via console (always) and an optional webhook.
+
+**Rule matching** (`conditions.go`) supports the four condition types from
+the schema: `GREATER_THAN`/`LESS_THAN`/`OUTSIDE_RANGE` against the anomaly's
+raw value, and `ANOMALY_COUNT` — "N anomalies within a window" — backed by
+an in-memory per-`(rule, device)` timestamp tracker
+(`anomalycount.go`), trimmed to the rule's configured window on every
+insert. Four representative rules ship in the seed data (matching the
+spec's own examples): a hard temperature threshold (90°C, CRITICAL), a
+vibration threshold (HIGH), a power-spike threshold (WARNING), and "three
+temperature anomalies within five minutes" (HIGH) — plus a sentinel rule
+used only by the direct machine-shutdown handler.
+
+**Deduplication + cooldown** (`store.go`): a new alert is refused if one for
+the same `(rule, device, metric)` is still open (an `INSERT ... ON CONFLICT
+... WHERE status = 'OPEN' DO NOTHING` matching the partial unique index from
+Phase 2, so this holds even under concurrent processing, not just via an
+application-level check) — or if the last one for that key resolved more
+recently than the rule's `cooldown_seconds`, which is what stops a flapping
+condition from re-paging immediately after resolution. Verified live: of
+109 qualifying anomalies processed in one run, 65 became new alerts and 25
+were correctly suppressed as duplicates of an already-open alert, with zero
+duplicate `OPEN` rows ever present in Postgres (checked directly).
+
+**Escalation**: a periodic sweep bumps any `OPEN` alert unacknowledged past
+`ALERT_ESCALATION_AFTER_SECONDS` (default 900s) one rung up the
+WARNING→HIGH→CRITICAL ladder and re-notifies — verified live with a
+shortened interval, including catching and fixing a real bug in the process
+(a Postgres parameter-encoding failure in the escalation query's interval
+arithmetic, fixed by switching to `make_interval()`).
+
+**Machine shutdown** is a second, independent alert path: `device.events`
+messages with `event_type = MACHINE_STOPPED` go straight to alert creation
+(bypassing rule matching, since it's not a metric threshold), verified live
+end-to-end from a synthetic MQTT publish through ingestion validation to a
+real Postgres alert row and console notification.
+
+**Notification providers** (`notify.go`): `ConsoleProvider` (always on,
+zero external dependencies) and `WebhookProvider` (retry + circuit breaker
+via `pkg/reliability`, optional). A webhook failure is logged and counted,
+never dead-lettered or retried against the message pipeline — the alert
+itself is already durably recorded in Postgres by the time notification is
+attempted, so a webhook outage means a missed notification, not lost alert
+data. Email/Slack are intentionally not implemented (no paid service
+credentials available in this environment) — the `NotificationProvider`
+interface exists specifically so they can be added later without touching
+the alert engine.
+
+```bash
+curl localhost:8084/metrics   # alerts_generated_total{severity}, alerts_suppressed_total{reason}, alerts_escalated_total, notifications_sent_total{provider}
+```
+
+Not yet built: incidents (Phase 8), auth/RBAC
 enforcement, REST/WS API, frontend, Grafana/Jaeger, Kubernetes manifests,
 CI/CD, and most formal testing (tests so far are unit tests for pure logic
-in the simulator, ingestion, stream-processor, and anomaly-detector
-services — the live MQTT/Kafka/Redis/InfluxDB/Postgres verification above
-was done manually against real infra, not yet captured as a permanent
-automated test; that lands in Phase 13). These land in Phases 7–18.
+in the simulator, ingestion, stream-processor, anomaly-detector, and
+alert-service — the live MQTT/Kafka/Redis/InfluxDB/Postgres verification
+above was done manually against real infra, not yet captured as a permanent
+automated test; that lands in Phase 13). These land in Phases 8–18.
 
 ## Local setup
 

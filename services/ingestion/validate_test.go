@@ -90,9 +90,10 @@ func TestValidateTelemetryRejectsEmptyUnit(t *testing.T) {
 
 func TestValidateMachineEventRequiresStatusOrEventType(t *testing.T) {
 	e := events.MachineEvent{
-		FactoryID: uuid.NewString(),
-		MachineID: uuid.NewString(),
-		Timestamp: time.Now().UTC(),
+		OrganizationID: uuid.NewString(),
+		FactoryID:      uuid.NewString(),
+		MachineID:      uuid.NewString(),
+		Timestamp:      time.Now().UTC(),
 	}
 	if err := validateMachineEvent(e); err == nil {
 		t.Fatal("expected error when both status and event_type are empty")

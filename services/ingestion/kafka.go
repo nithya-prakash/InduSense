@@ -9,6 +9,7 @@ import (
 
 	"github.com/nithya-prakash/indusense/pkg/events"
 	"github.com/nithya-prakash/indusense/pkg/reliability"
+	"github.com/nithya-prakash/indusense/pkg/tracing"
 	kafka "github.com/segmentio/kafka-go"
 )
 
@@ -133,8 +134,11 @@ func (k *kafkaSink) writeWithProtection(ctx context.Context, w *kafka.Writer, ke
 		return fmt.Errorf("circuit breaker open for kafka topic %s", w.Topic)
 	}
 
+	var headers []kafka.Header
+	tracing.InjectKafka(ctx, &headers)
+
 	err := reliability.RetryWithBackoff(ctx, k.maxRetries, k.retryDelay, func(d time.Duration) { time.Sleep(d) }, func() error {
-		return w.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload})
+		return w.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload, Headers: headers})
 	})
 
 	if err != nil {

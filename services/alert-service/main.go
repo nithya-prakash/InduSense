@@ -21,16 +21,26 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nithya-prakash/indusense/pkg/events"
 	"github.com/nithya-prakash/indusense/pkg/incidents"
+	"github.com/nithya-prakash/indusense/pkg/logging"
+	"github.com/nithya-prakash/indusense/pkg/tracing"
 	kafka "github.com/segmentio/kafka-go"
 )
 
 const machineShutdownMetric = "machine_status"
+
+var logger = logging.Init("alert-service")
 
 func main() {
 	cfg := loadConfig()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := tracing.Init(ctx, "alert-service")
+	if err != nil {
+		log.Printf("alert-service: tracing disabled: %v", err)
+	}
+	defer shutdownTracing(context.Background())
 
 	pool, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {
@@ -133,6 +143,10 @@ func consumeAnomalies(ctx context.Context, cfg Config, kio *kafkaIO, rules *rule
 func processAnomaly(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, incidentStore *incidents.Store, counter *anomalyCountTracker, providers []NotificationProvider, msg kafka.Message) bool {
 	metricAnomaliesConsumed.Inc()
 
+	ctx = tracing.ExtractKafka(ctx, msg.Headers)
+	ctx, span := tracing.Tracer("alert-service").Start(ctx, "alert_service.process_anomaly")
+	defer span.End()
+
 	var anomaly events.AnomalyDetected
 	if err := json.Unmarshal(msg.Value, &anomaly); err != nil {
 		metricMessagesFailed.WithLabelValues("unmarshal").Inc()
@@ -175,6 +189,7 @@ func processAnomaly(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCa
 		switch result {
 		case resultCreated:
 			metricAlertsGenerated.WithLabelValues(created.Severity).Inc()
+			logging.WithContext(ctx, logger).Info("alert created from anomaly", "event_id", anomaly.EventID, "device_id", anomaly.DeviceID, "organization_id", anomaly.OrganizationID, "severity", created.Severity, "rule_id", rule.ID)
 			openOrAttachIncident(ctx, incidentStore, created)
 			publishAndNotify(ctx, kio, providers, created, rule.ID, events.AlertEventCreated, false)
 		case resultSuppressedOpen:
@@ -208,6 +223,10 @@ func consumeDeviceEvents(ctx context.Context, cfg Config, kio *kafkaIO, rules *r
 }
 
 func processDeviceEvent(ctx context.Context, cfg Config, kio *kafkaIO, rules *ruleCache, store *alertStore, incidentStore *incidents.Store, providers []NotificationProvider, msg kafka.Message) bool {
+	ctx = tracing.ExtractKafka(ctx, msg.Headers)
+	ctx, span := tracing.Tracer("alert-service").Start(ctx, "alert_service.process_device_event")
+	defer span.End()
+
 	var evt events.NormalizedMachineEvent
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
 		metricMessagesFailed.WithLabelValues("unmarshal").Inc()
@@ -244,6 +263,7 @@ func processDeviceEvent(ctx context.Context, cfg Config, kio *kafkaIO, rules *ru
 	switch result {
 	case resultCreated:
 		metricAlertsGenerated.WithLabelValues(created.Severity).Inc()
+		logging.WithContext(ctx, logger).Info("alert created from device event", "event_id", evt.CorrelationID, "device_id", evt.DeviceID, "organization_id", evt.OrganizationID, "severity", created.Severity, "rule_id", rule.ID)
 		openOrAttachIncident(ctx, incidentStore, created)
 		publishAndNotify(ctx, kio, providers, created, rule.ID, events.AlertEventCreated, false)
 	case resultSuppressedOpen:
@@ -271,15 +291,15 @@ func openOrAttachIncident(ctx context.Context, incidentStore *incidents.Store, a
 	}
 	incidentID, created, err := incidentStore.OpenOrAttach(ctx, ref)
 	if err != nil {
-		log.Printf("alert-service: failed to link alert %s to an incident: %v", alert.ID, err)
+		logging.WithContext(ctx, logger).Error("failed to link alert to an incident", "error", err, "alert_id", alert.ID, "device_id", alert.DeviceID, "organization_id", alert.OrganizationID)
 		return
 	}
 	if created {
 		metricIncidentsCreated.Inc()
-		log.Printf("alert-service: opened incident %s from alert %s", incidentID, alert.ID)
+		logging.WithContext(ctx, logger).Info("incident opened", "incident_id", incidentID, "alert_id", alert.ID, "device_id", alert.DeviceID, "organization_id", alert.OrganizationID)
 	} else {
 		metricAlertsAttachedToIncident.Inc()
-		log.Printf("alert-service: attached alert %s to existing incident %s", alert.ID, incidentID)
+		logging.WithContext(ctx, logger).Info("alert attached to existing incident", "incident_id", incidentID, "alert_id", alert.ID, "device_id", alert.DeviceID, "organization_id", alert.OrganizationID)
 	}
 }
 
@@ -297,6 +317,28 @@ func runIncidentGaugeRefresher(ctx context.Context, pool *pgxpool.Pool) {
 				continue
 			}
 			metricIncidentsOpen.Set(count)
+
+			rows, err := pool.Query(ctx, `SELECT severity, count(*) FROM incidents WHERE status NOT IN ('RESOLVED', 'CLOSED') GROUP BY severity`)
+			if err != nil {
+				log.Printf("alert-service: incident-by-severity gauge refresh failed: %v", err)
+				continue
+			}
+			seen := map[string]bool{}
+			for rows.Next() {
+				var severity string
+				var n float64
+				if err := rows.Scan(&severity, &n); err != nil {
+					continue
+				}
+				metricIncidentsOpenBySeverity.WithLabelValues(severity).Set(n)
+				seen[severity] = true
+			}
+			rows.Close()
+			for _, s := range []string{"INFO", "WARNING", "HIGH", "CRITICAL"} {
+				if !seen[s] {
+					metricIncidentsOpenBySeverity.WithLabelValues(s).Set(0)
+				}
+			}
 		}
 	}
 }

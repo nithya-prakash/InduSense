@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 11 of 18 (Dashboard) complete.** This README will be
+> **Status: Phase 12 of 18 (Observability) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -575,6 +575,83 @@ live-Postgres/Redis integration tests for incidents and auth, plus this
 phase's live browser verification — none of which is yet captured as a
 permanent automated test; that lands in Phase 13). These land in
 Phases 12–18.
+
+## Current status (Phase 12 — Observability)
+
+Four pillars, all live-verified against real running services rather than
+asserted from reading the code:
+
+**Prometheus** ([infrastructure/prometheus/prometheus.yml](infrastructure/prometheus/prometheus.yml))
+scrapes all five Go services (`api`, `ingestion`, `stream-processor`,
+`anomaly-detector`, `alert-service`) every 10s. Verified via Prometheus's own
+`/api/v1/targets` showing all five as `up`. Two new gauges were added because
+the dashboards needed data the existing metrics didn't expose:
+`devices_by_status` (`services/api`, refreshed from Postgres every 15s) and
+`incidents_open_by_severity` (`services/alert-service`, same pattern) — both
+confirmed with real non-zero values (`devices_by_status{status="ACTIVE"} 169`,
+`incidents_open_by_severity{severity="CRITICAL"} 3`) rather than just
+structurally present. Kafka broker JMX metrics are explicitly **not
+implemented** — no JMX exporter sidecar — and the scrape config says so.
+
+**Grafana** ([infrastructure/grafana/](infrastructure/grafana/)) auto-provisions
+a Prometheus + Jaeger datasource and four dashboards (Platform, Kafka, IoT,
+Anomaly & Alerting) via YAML providers, confirmed present through Grafana's
+own `/api/search`. All four were opened in a real browser and watched respond
+to a real traffic burst generated with the simulator
+(`SENSOR_COUNT=200 MESSAGES_PER_SECOND=200 ANOMALY_RATE=0.1`, 20s): API
+throughput/latency/CPU/memory panels spiked and recovered in sync, Kafka
+consumer lag rose then drained as anomaly-detector and stream-processor
+caught up, and IoT/incident panels tracked the correct live counts — not
+just non-empty charts, but charts whose shape matched a traffic pattern
+I actually caused.
+
+**Structured logging** (`pkg/logging`, a thin `log/slog` JSON handler) is
+wired into the pipeline's key lifecycle events — telemetry/machine-event
+ingested, dedup and validation failures, anomaly detected, alert created,
+incident opened/attached, and every API request — across all five Go
+services. Fields match the spec: `timestamp`, `service`, `level`, `message`,
+plus contextual `event_id`/`device_id`/`organization_id` at each call site
+and `trace_id` whenever the call happens inside a span. This is a
+deliberately partial migration: the remaining ad-hoc `log.Printf` calls
+(mostly startup/shutdown lines and background-refresher failures) were left
+alone rather than converted wholesale, since they carry no per-event fields
+worth structuring.
+
+**OpenTelemetry tracing** (`pkg/tracing`) exports to the Jaeger container
+added this phase, over OTLP/HTTP. Getting this right required one real fix:
+`otlptracehttp.WithEndpointURL` takes the URL's path as-is and does *not*
+default it to `/v1/traces`, so passing `OTEL_EXPORTER_OTLP_ENDPOINT` (an
+OTel-standard base URL with no path) straight through 404'd against Jaeger's
+receiver — switched to `WithEndpoint(host)`, which does apply the default
+path, and confirmed the `traces export: 404` errors stopped appearing in the
+logs. Trace context is propagated by hand across Kafka: a `kafka.Header`
+carrier adapts `propagation.TextMapCarrier` so the standard W3C
+`traceparent` gets injected on every publish (ingestion → telemetry.raw,
+stream-processor → telemetry.processed, anomaly-detector →
+anomalies.detected, alert-service → alerts) and extracted on every consume.
+The `api` service gets per-request spans via `otelhttp` middleware instead,
+since HTTP tracing is a standard, separate concern from the Kafka pipeline.
+
+Verified live end-to-end, not just "the exporter didn't error": after a
+simulator run, Jaeger's `/api/services` listed all five real services, and
+querying `/api/traces` for a single trace ID found a genuine four-span chain
+with correct parent/child relationships and monotonically increasing start
+times — `ingestion.process_message` (root) → `stream_processor.process`
+(child) → `anomaly_detector.detect` (child of that) →
+`alert_service.process_anomaly` (child of that) — meaning a `traceparent`
+header genuinely rode across three separate Kafka hops and was correctly
+extracted each time, not just three isolated same-ID spans. The same trace
+ID also showed up verbatim in that request's structured log line
+(`anomaly-detector`'s "anomaly detected" record), confirming logs and traces
+share an ID a reader could actually pivot between.
+
+**Not implemented in this phase**: tracing on the frontend (no browser-side
+OTel SDK); log shipping to any aggregator (Loki, ELK) — logs are stdout-only,
+collected by `docker compose logs`; Prometheus alerting rules (Alertmanager)
+— Grafana dashboards exist but no alert *rules* fire from Prometheus itself,
+only from `alert-service`'s own domain logic; and most `log.Printf` call
+sites outside the lifecycle events above remain unstructured, as noted.
+These, along with Kubernetes manifests and CI/CD, land in Phases 14–18.
 
 ## Local setup
 

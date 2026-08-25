@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nithya-prakash/indusense/pkg/events"
+	"github.com/nithya-prakash/indusense/pkg/tracing"
 	kafka "github.com/segmentio/kafka-go"
 )
 
@@ -59,7 +60,9 @@ func (k *kafkaIO) publishAlert(ctx context.Context, key string, evt events.Alert
 	if err != nil {
 		return fmt.Errorf("marshal alert event: %w", err)
 	}
-	return k.alertWriter.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload})
+	var headers []kafka.Header
+	tracing.InjectKafka(ctx, &headers)
+	return k.alertWriter.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload, Headers: headers})
 }
 
 func (k *kafkaIO) deadLetter(ctx context.Context, rawPayload []byte, cause error, stage, correlationID, sourceTopic string) error {

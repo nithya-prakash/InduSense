@@ -24,14 +24,24 @@ import (
 
 	"github.com/influxdata/influxdb-client-go/v2/api/write"
 	"github.com/nithya-prakash/indusense/pkg/events"
+	"github.com/nithya-prakash/indusense/pkg/logging"
+	"github.com/nithya-prakash/indusense/pkg/tracing"
 	kafka "github.com/segmentio/kafka-go"
 )
+
+var logger = logging.Init("stream-processor")
 
 func main() {
 	cfg := loadConfig()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := tracing.Init(ctx, "stream-processor")
+	if err != nil {
+		log.Printf("stream-processor: tracing disabled: %v", err)
+	}
+	defer shutdownTracing(context.Background())
 
 	kio := newKafkaIO(cfg)
 	defer kio.close()
@@ -94,11 +104,15 @@ func consumeLoop(ctx context.Context, kio *kafkaIO, dedup *deduplicator, influx 
 func processMessage(ctx context.Context, kio *kafkaIO, dedup *deduplicator, influx *influxSink, registry *seriesRegistry, msg kafka.Message) bool {
 	metricMessagesConsumed.Inc()
 
+	ctx = tracing.ExtractKafka(ctx, msg.Headers)
+	ctx, span := tracing.Tracer("stream-processor").Start(ctx, "stream_processor.process")
+	defer span.End()
+
 	var evt events.NormalizedTelemetryEvent
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
 		metricMessagesFailed.WithLabelValues("unmarshal").Inc()
 		if dlqErr := kio.deadLetter(ctx, msg.Value, err, "unmarshal", ""); dlqErr != nil {
-			log.Printf("stream-processor: dead-letter write failed for malformed message: %v", dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write failed for malformed message", "error", dlqErr)
 			return false
 		}
 		metricDLQMessages.Inc()
@@ -111,7 +125,7 @@ func processMessage(ctx context.Context, kio *kafkaIO, dedup *deduplicator, infl
 		// is retried once Redis recovers rather than silently processed
 		// without dedup protection.
 		metricMessagesFailed.WithLabelValues("dedup_unavailable").Inc()
-		log.Printf("stream-processor: dedup check failed for event_id=%s: %v", evt.EventID, err)
+		logging.WithContext(ctx, logger).Error("dedup check failed", "error", err, "event_id", evt.EventID, "device_id", evt.DeviceID, "organization_id", evt.OrganizationID)
 		return false
 	}
 	if !firstSeen {
@@ -131,7 +145,7 @@ func processMessage(ctx context.Context, kio *kafkaIO, dedup *deduplicator, infl
 	if err := influx.writeRawPoint(ctx, key, evt.Timestamp, evt.Value); err != nil {
 		metricMessagesFailed.WithLabelValues("influx_write").Inc()
 		if dlqErr := kio.deadLetter(ctx, msg.Value, err, "influxdb_write", evt.EventID); dlqErr != nil {
-			log.Printf("stream-processor: dead-letter write also failed for event_id=%s, leaving unacked: %v", evt.EventID, dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write also failed, leaving unacked", "error", dlqErr, "event_id", evt.EventID, "device_id", evt.DeviceID, "organization_id", evt.OrganizationID)
 			return false
 		}
 		metricDLQMessages.Inc()
@@ -143,7 +157,7 @@ func processMessage(ctx context.Context, kio *kafkaIO, dedup *deduplicator, infl
 	if err := kio.publishProcessed(ctx, evt.DeviceID, evt); err != nil {
 		metricMessagesFailed.WithLabelValues("republish").Inc()
 		if dlqErr := kio.deadLetter(ctx, msg.Value, err, "republish_processed", evt.EventID); dlqErr != nil {
-			log.Printf("stream-processor: dead-letter write also failed for event_id=%s, leaving unacked: %v", evt.EventID, dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write also failed, leaving unacked", "error", dlqErr, "event_id", evt.EventID, "device_id", evt.DeviceID, "organization_id", evt.OrganizationID)
 			return false
 		}
 		metricDLQMessages.Inc()

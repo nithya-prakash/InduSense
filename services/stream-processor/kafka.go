@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/nithya-prakash/indusense/pkg/events"
+	"github.com/nithya-prakash/indusense/pkg/tracing"
 	kafka "github.com/segmentio/kafka-go"
 )
 
@@ -67,7 +68,9 @@ func (k *kafkaIO) publishProcessed(ctx context.Context, key string, evt events.N
 	if err != nil {
 		return fmt.Errorf("marshal processed telemetry: %w", err)
 	}
-	return k.processedWriter.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload})
+	var headers []kafka.Header
+	tracing.InjectKafka(ctx, &headers)
+	return k.processedWriter.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload, Headers: headers})
 }
 
 func (k *kafkaIO) deadLetter(ctx context.Context, rawPayload []byte, cause error, stage, correlationID string) error {

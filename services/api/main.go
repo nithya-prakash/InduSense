@@ -17,15 +17,26 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nithya-prakash/indusense/pkg/auth"
 	"github.com/nithya-prakash/indusense/pkg/incidents"
+	"github.com/nithya-prakash/indusense/pkg/logging"
+	"github.com/nithya-prakash/indusense/pkg/tracing"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
+
+var logger = logging.Init("api")
 
 func main() {
 	cfg := loadConfig()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := tracing.Init(ctx, "api")
+	if err != nil {
+		log.Printf("api: tracing disabled: %v", err)
+	}
+	defer shutdownTracing(context.Background())
 
 	pool, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {
@@ -43,6 +54,7 @@ func main() {
 
 	hub := newWSHub()
 	go runAlertsFanOut(ctx, cfg.KafkaBrokers, cfg.TopicAlerts, hub)
+	go runDeviceGaugeRefresher(ctx, pool)
 
 	mux := http.NewServeMux()
 	registerRoutes(mux, cfg, pool, redisClient, authSvc, incidentStore, limiter, queryAPI, hub)
@@ -54,7 +66,9 @@ func main() {
 		withCORS(cfg.CORSAllowedOrigin),
 	)
 
-	server := &http.Server{Addr: ":" + cfg.Port, Handler: handler}
+	tracedHandler := otelhttp.NewHandler(handler, "api.request")
+
+	server := &http.Server{Addr: ":" + cfg.Port, Handler: tracedHandler}
 
 	go func() {
 		<-ctx.Done()
@@ -68,6 +82,44 @@ func main() {
 		log.Fatalf("api: server error: %v", err)
 	}
 	log.Println("api: shutdown complete")
+}
+
+// runDeviceGaugeRefresher periodically publishes device counts by status
+// across all organizations — deliberately not tenant-scoped, since this is
+// a platform-wide operational gauge for Grafana, not a value returned to
+// any single tenant's API response.
+func runDeviceGaugeRefresher(ctx context.Context, pool *pgxpool.Pool) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	statuses := []string{"PROVISIONED", "ACTIVE", "OFFLINE", "MAINTENANCE", "DECOMMISSIONED"}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rows, err := pool.Query(ctx, `SELECT status, count(*) FROM devices GROUP BY status`)
+			if err != nil {
+				log.Printf("api: device gauge refresh failed: %v", err)
+				continue
+			}
+			seen := map[string]bool{}
+			for rows.Next() {
+				var status string
+				var n float64
+				if err := rows.Scan(&status, &n); err != nil {
+					continue
+				}
+				metricDevicesByStatus.WithLabelValues(status).Set(n)
+				seen[status] = true
+			}
+			rows.Close()
+			for _, s := range statuses {
+				if !seen[s] {
+					metricDevicesByStatus.WithLabelValues(s).Set(0)
+				}
+			}
+		}
+	}
 }
 
 func registerRoutes(

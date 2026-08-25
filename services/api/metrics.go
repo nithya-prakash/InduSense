@@ -21,4 +21,9 @@ var (
 		Name: "websocket_connections",
 		Help: "Currently connected WebSocket clients.",
 	})
+
+	metricDevicesByStatus = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "devices_by_status",
+		Help: "Devices grouped by lifecycle status, across all organizations — backs the IoT dashboard's active/offline device panels.",
+	}, []string{"status"})
 )

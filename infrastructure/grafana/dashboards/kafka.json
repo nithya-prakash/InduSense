@@ -1,0 +1,51 @@
+{
+  "title": "InduSense — Kafka",
+  "uid": "indusense-kafka",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Messages consumed/received per service (msg/s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "sum by (job) (rate(messages_received_total[1m]))", "legendFormat": "{{job}} received" },
+        { "expr": "sum by (job) (rate(messages_consumed_total[1m]))", "legendFormat": "{{job}} consumed" },
+        { "expr": "sum by (job) (rate(anomalies_consumed_total[1m]))", "legendFormat": "{{job}} anomalies consumed" }
+      ]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Consumer lag by service",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [{ "expr": "kafka_consumer_lag", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Failed messages per service (msg/s, by reason)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [{ "expr": "sum by (job, reason) (rate(messages_failed_total[1m]))", "legendFormat": "{{job}}/{{reason}}" }]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Dead-letter volume per service (msg/s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [{ "expr": "sum by (job) (rate(dlq_messages_total[1m]))", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Duplicate events detected (msg/s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [{ "expr": "rate(duplicate_events_total[1m])", "legendFormat": "duplicates/s" }]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Kafka publish/end-to-end processing latency (p95, s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le, job) (rate(processing_latency_seconds_bucket[5m])))", "legendFormat": "{{job}}" }]
+    }
+  ]
+}

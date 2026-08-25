@@ -20,13 +20,24 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nithya-prakash/indusense/pkg/events"
+	"github.com/nithya-prakash/indusense/pkg/logging"
+	"github.com/nithya-prakash/indusense/pkg/tracing"
+	"go.opentelemetry.io/otel/attribute"
 )
+
+var logger = logging.Init("ingestion")
 
 func main() {
 	cfg := loadConfig()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := tracing.Init(ctx, "ingestion")
+	if err != nil {
+		log.Printf("ingestion: tracing disabled: %v", err)
+	}
+	defer shutdownTracing(context.Background())
 
 	sink := newKafkaSink(cfg)
 	defer sink.close()
@@ -67,6 +78,10 @@ func processMessage(ctx context.Context, sink *kafkaSink, job inboundMessage) {
 	start := time.Now()
 	defer func() { metricProcessingLatency.Observe(time.Since(start).Seconds()) }()
 
+	ctx, span := tracing.Tracer("ingestion").Start(ctx, "ingestion.process_message")
+	span.SetAttributes(attribute.String("mqtt.topic", job.topic))
+	defer span.End()
+
 	switch {
 	case strings.HasSuffix(job.topic, "/telemetry"):
 		metricMessagesReceived.WithLabelValues("telemetry").Inc()
@@ -78,7 +93,7 @@ func processMessage(ctx context.Context, sink *kafkaSink, job inboundMessage) {
 		metricMessagesReceived.WithLabelValues("events").Inc()
 		handleMachineEvent(ctx, sink, job)
 	default:
-		log.Printf("ingestion: unrecognized topic %q, dropping", job.topic)
+		logging.WithContext(ctx, logger).Warn("unrecognized MQTT topic, dropping", "mqtt_topic", job.topic)
 		job.ack()
 	}
 }
@@ -88,7 +103,7 @@ func handleTelemetry(ctx context.Context, sink *kafkaSink, job inboundMessage) {
 	if err := json.Unmarshal(job.payload, &raw); err != nil {
 		metricMessagesFailed.WithLabelValues("validation").Inc()
 		if dlqErr := sink.deadLetterValidationFailure(ctx, job.payload, err, uuid.NewString(), job.topic); dlqErr != nil {
-			log.Printf("ingestion: dead-letter write failed for malformed telemetry, leaving unacked: %v", dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write failed for malformed telemetry, leaving unacked", "error", dlqErr, "mqtt_topic", job.topic)
 			return // do not ack: let MQTT redeliver
 		}
 		job.ack()
@@ -98,7 +113,7 @@ func handleTelemetry(ctx context.Context, sink *kafkaSink, job inboundMessage) {
 	if err := validateTelemetry(raw); err != nil {
 		metricMessagesFailed.WithLabelValues("validation").Inc()
 		if dlqErr := sink.deadLetterValidationFailure(ctx, job.payload, err, raw.EventID, job.topic); dlqErr != nil {
-			log.Printf("ingestion: dead-letter write failed for invalid telemetry event_id=%s, leaving unacked: %v", raw.EventID, dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write failed for invalid telemetry, leaving unacked", "error", dlqErr, "event_id", raw.EventID, "device_id", raw.DeviceID, "organization_id", raw.OrganizationID)
 			return
 		}
 		job.ack()
@@ -113,9 +128,10 @@ func handleTelemetry(ctx context.Context, sink *kafkaSink, job inboundMessage) {
 	}
 
 	if err := sink.publishTelemetry(ctx, raw.DeviceID, normalized, job.payload, job.topic); err != nil {
-		log.Printf("ingestion: could not durably record telemetry event_id=%s, leaving unacked for redelivery: %v", raw.EventID, err)
+		logging.WithContext(ctx, logger).Error("could not durably record telemetry, leaving unacked for redelivery", "error", err, "event_id", raw.EventID, "device_id", raw.DeviceID, "organization_id", raw.OrganizationID)
 		return
 	}
+	logging.WithContext(ctx, logger).Info("telemetry event ingested", "event_id", raw.EventID, "device_id", raw.DeviceID, "organization_id", raw.OrganizationID)
 	job.ack()
 }
 
@@ -124,7 +140,7 @@ func handleMachineEvent(ctx context.Context, sink *kafkaSink, job inboundMessage
 	if err := json.Unmarshal(job.payload, &raw); err != nil {
 		metricMessagesFailed.WithLabelValues("validation").Inc()
 		if dlqErr := sink.deadLetterValidationFailure(ctx, job.payload, err, uuid.NewString(), job.topic); dlqErr != nil {
-			log.Printf("ingestion: dead-letter write failed for malformed machine event, leaving unacked: %v", dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write failed for malformed machine event, leaving unacked", "error", dlqErr, "mqtt_topic", job.topic)
 			return
 		}
 		job.ack()
@@ -135,7 +151,7 @@ func handleMachineEvent(ctx context.Context, sink *kafkaSink, job inboundMessage
 	if err := validateMachineEvent(raw); err != nil {
 		metricMessagesFailed.WithLabelValues("validation").Inc()
 		if dlqErr := sink.deadLetterValidationFailure(ctx, job.payload, err, correlationID, job.topic); dlqErr != nil {
-			log.Printf("ingestion: dead-letter write failed for invalid machine event, leaving unacked: %v", dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write failed for invalid machine event, leaving unacked", "error", dlqErr, "device_id", raw.DeviceID, "organization_id", raw.OrganizationID)
 			return
 		}
 		job.ack()
@@ -150,8 +166,9 @@ func handleMachineEvent(ctx context.Context, sink *kafkaSink, job inboundMessage
 	}
 
 	if err := sink.publishMachineEvent(ctx, raw.DeviceID, normalized, job.payload, job.topic); err != nil {
-		log.Printf("ingestion: could not durably record machine event, leaving unacked for redelivery: %v", err)
+		logging.WithContext(ctx, logger).Error("could not durably record machine event, leaving unacked for redelivery", "error", err, "event_id", correlationID, "device_id", raw.DeviceID, "organization_id", raw.OrganizationID)
 		return
 	}
+	logging.WithContext(ctx, logger).Info("machine event ingested", "event_id", correlationID, "device_id", raw.DeviceID, "organization_id", raw.OrganizationID, "event_type", raw.EventType)
 	job.ack()
 }

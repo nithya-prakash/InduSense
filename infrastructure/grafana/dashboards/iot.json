@@ -1,0 +1,54 @@
+{
+  "title": "InduSense — IoT",
+  "uid": "indusense-iot",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "MQTT telemetry messages/sec (ingestion)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum(rate(messages_received_total{topic_kind=\"telemetry\"}[1m]))", "legendFormat": "telemetry msg/s" }]
+    },
+    {
+      "id": 2, "type": "stat", "title": "MQTT connection (ingestion)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "targets": [{ "expr": "mqtt_connections" }],
+      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }] }, "overrides": [] }
+    },
+    {
+      "id": 3, "type": "stat", "title": "Active devices",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "targets": [{ "expr": "devices_by_status{status=\"ACTIVE\"}" }]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Offline devices",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "targets": [{ "expr": "devices_by_status{status=\"OFFLINE\"}" }]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Devices by status over time",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [{ "expr": "devices_by_status", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Telemetry write throughput to InfluxDB (points/s, proxy via successful processing)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [{ "expr": "sum(rate(messages_consumed_total[1m]))", "legendFormat": "stream-processor consumed/s" }]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Windowed aggregates written/sec",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{ "expr": "rate(windowed_aggregates_written_total[1m])", "legendFormat": "aggregates/s" }]
+    }
+  ]
+}

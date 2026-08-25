@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: api
+    static_configs:
+      - targets: ["api:8080"]
+
+  - job_name: ingestion
+    static_configs:
+      - targets: ["ingestion:8081"]
+
+  - job_name: stream-processor
+    static_configs:
+      - targets: ["stream-processor:8082"]
+
+  - job_name: anomaly-detector
+    static_configs:
+      - targets: ["anomaly-detector:8083"]
+
+  - job_name: alert-service
+    static_configs:
+      - targets: ["alert-service:8084"]
+
+  # Kafka broker JMX metrics aren't exposed by the plain apache/kafka image
+  # used here (no JMX exporter sidecar configured) — kafka_consumer_lag is
+  # still available per-service above, sourced from each Go consumer's own
+  # kafka-go Reader.Stats(), not from the broker directly. Documented rather
+  # than silently missing: broker-level throughput/ISR metrics are
+  # NOT IMPLEMENTED in this deployment.

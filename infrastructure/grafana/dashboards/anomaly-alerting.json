@@ -1,0 +1,60 @@
+{
+  "title": "InduSense — Anomaly & Alerting",
+  "uid": "indusense-anomaly-alerting",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Anomalies/sec by detection method",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum by (method) (rate(anomalies_detected_total[1m]))", "legendFormat": "{{method}}" }]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Alerts generated/sec by severity",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [{ "expr": "sum by (severity) (rate(alerts_generated_total[1m]))", "legendFormat": "{{severity}}" }]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Alerts suppressed/sec (dedup vs cooldown)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [{ "expr": "sum by (reason) (rate(alerts_suppressed_total[1m]))", "legendFormat": "{{reason}}" }]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Open CRITICAL incidents",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "targets": [{ "expr": "incidents_open_by_severity{severity=\"CRITICAL\"}" }],
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } }, "overrides": [] }
+    },
+    {
+      "id": 5, "type": "stat", "title": "Total open incidents",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 8 },
+      "targets": [{ "expr": "incidents_open_total" }]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Open incidents by severity",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [{ "expr": "incidents_open_by_severity", "legendFormat": "{{severity}}" }]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "DLQ volume across services (msg/s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [{ "expr": "sum by (job) (rate(dlq_messages_total[1m]))", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Isolation forests (re)trained",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [{ "expr": "increase(isolation_forests_trained_total[10m])", "legendFormat": "trainings / 10m" }]
+    }
+  ]
+}

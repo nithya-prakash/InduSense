@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nithya-prakash/indusense/pkg/auth"
+	"github.com/nithya-prakash/indusense/pkg/logging"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -55,8 +56,9 @@ func withLogging(next http.Handler) http.Handler {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
-		log.Printf(`{"method":%q,"path":%q,"status":%d,"duration_ms":%d,"request_id":%q}`,
-			r.Method, r.URL.Path, sw.status, time.Since(start).Milliseconds(), requestIDFromContext(r.Context()))
+		logging.WithContext(r.Context(), logger).Info("request handled",
+			"method", r.Method, "path", r.URL.Path, "status", sw.status,
+			"duration_ms", time.Since(start).Milliseconds(), "request_id", requestIDFromContext(r.Context()))
 		metricAPIRequestsTotal.WithLabelValues(r.Method, r.URL.Path, fmt.Sprintf("%d", sw.status)).Inc()
 		metricAPIRequestDuration.WithLabelValues(r.Method, r.URL.Path).Observe(time.Since(start).Seconds())
 	})

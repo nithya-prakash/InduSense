@@ -1,0 +1,57 @@
+{
+  "title": "InduSense — Platform",
+  "uid": "indusense-platform",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "API throughput (req/s by status)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [{ "expr": "sum by (status) (rate(api_requests_total[1m]))", "legendFormat": "{{status}}" }]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "API latency (p50 / p95 / p99)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(api_request_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(api_request_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(api_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "API error rate (5xx / s)",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "targets": [{ "expr": "sum(rate(api_requests_total{status=~\"5..\"}[1m]))", "legendFormat": "5xx/s" }]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Process CPU (seconds/s) by service",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "targets": [{ "expr": "sum by (job) (rate(process_cpu_seconds_total[1m]))", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Process resident memory (bytes) by service",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "targets": [{ "expr": "process_resident_memory_bytes", "legendFormat": "{{job}}" }]
+    },
+    {
+      "id": 6, "type": "stat", "title": "WebSocket connections",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 16 },
+      "targets": [{ "expr": "websocket_connections" }]
+    },
+    {
+      "id": 7, "type": "stat", "title": "Devices by status",
+      "datasource": "Prometheus",
+      "gridPos": { "h": 5, "w": 18, "x": 6, "y": 16 },
+      "targets": [{ "expr": "devices_by_status", "legendFormat": "{{status}}" }]
+    }
+  ]
+}

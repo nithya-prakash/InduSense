@@ -18,14 +18,24 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nithya-prakash/indusense/pkg/events"
+	"github.com/nithya-prakash/indusense/pkg/logging"
+	"github.com/nithya-prakash/indusense/pkg/tracing"
 	kafka "github.com/segmentio/kafka-go"
 )
+
+var logger = logging.Init("anomaly-detector")
 
 func main() {
 	cfg := loadConfig()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	shutdownTracing, err := tracing.Init(ctx, "anomaly-detector")
+	if err != nil {
+		log.Printf("anomaly-detector: tracing disabled: %v", err)
+	}
+	defer shutdownTracing(context.Background())
 
 	cat, err := newCatalog(ctx, cfg.PostgresDSN)
 	if err != nil {
@@ -107,11 +117,15 @@ func consumeLoop(ctx context.Context, cfg Config, kio *kafkaIO, cat *catalog, tr
 func processMessage(ctx context.Context, cfg Config, kio *kafkaIO, cat *catalog, trackers *statisticalTrackers, fs *featureStore, forests *forestRegistry, msg kafka.Message) bool {
 	metricMessagesConsumed.Inc()
 
+	ctx = tracing.ExtractKafka(ctx, msg.Headers)
+	ctx, span := tracing.Tracer("anomaly-detector").Start(ctx, "anomaly_detector.detect")
+	defer span.End()
+
 	var evt events.NormalizedTelemetryEvent
 	if err := json.Unmarshal(msg.Value, &evt); err != nil {
 		metricMessagesFailed.WithLabelValues("unmarshal").Inc()
 		if dlqErr := kio.deadLetter(ctx, msg.Value, err, "unmarshal", ""); dlqErr != nil {
-			log.Printf("anomaly-detector: dead-letter write failed for malformed message: %v", dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write failed for malformed message", "error", dlqErr)
 			return false
 		}
 		metricDLQMessages.Inc()
@@ -172,10 +186,12 @@ func processMessage(ctx context.Context, cfg Config, kio *kafkaIO, cat *catalog,
 	if err := kio.publishAnomaly(ctx, evt.DeviceID, anomaly); err != nil {
 		metricMessagesFailed.WithLabelValues("publish_anomaly").Inc()
 		if dlqErr := kio.deadLetter(ctx, msg.Value, err, "publish_anomaly", evt.EventID); dlqErr != nil {
-			log.Printf("anomaly-detector: dead-letter write also failed for event_id=%s, leaving unacked: %v", evt.EventID, dlqErr)
+			logging.WithContext(ctx, logger).Error("dead-letter write also failed, leaving unacked", "error", dlqErr, "event_id", evt.EventID, "device_id", evt.DeviceID, "organization_id", evt.OrganizationID)
 			return false
 		}
 		metricDLQMessages.Inc()
+	} else {
+		logging.WithContext(ctx, logger).Info("anomaly detected", "anomaly_id", anomaly.AnomalyID, "event_id", evt.EventID, "device_id", evt.DeviceID, "organization_id", evt.OrganizationID, "severity", severity, "methods", methods)
 	}
 
 	return true

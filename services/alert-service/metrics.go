@@ -31,6 +31,11 @@ var (
 		Help: "Currently open (non-terminal) incidents.",
 	})
 
+	metricIncidentsOpenBySeverity = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "incidents_open_by_severity",
+		Help: "Currently open (non-terminal) incidents, by severity — what the Grafana 'critical incidents' panel actually needs.",
+	}, []string{"severity"})
+
 	metricIncidentsCreated = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "incidents_created_total",
 		Help: "New incidents opened from an alert.",

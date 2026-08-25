@@ -165,6 +165,7 @@ services:
       INGESTION_WORKER_POOL_SIZE: ${INGESTION_WORKER_POOL_SIZE:-50}
       INGESTION_QUEUE_CAPACITY: ${INGESTION_QUEUE_CAPACITY:-10000}
       INGESTION_PORT: ${INGESTION_PORT:-8081}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       mosquitto:
         condition: service_healthy
@@ -200,6 +201,7 @@ services:
       INFLUXDB_ORG: ${INFLUXDB_ORG:-indusense}
       INFLUXDB_BUCKET: ${INFLUXDB_BUCKET:-telemetry}
       STREAM_PROCESSOR_PORT: "8082"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       kafka:
         condition: service_healthy
@@ -232,6 +234,7 @@ services:
       KAFKA_TOPIC_DEAD_LETTER: ${KAFKA_TOPIC_DEAD_LETTER:-dead-letter}
       ANOMALY_POSTGRES_DSN: postgres://${POSTGRES_USER:-indusense}:${POSTGRES_PASSWORD:-indusense_dev_password}@postgres:5432/${POSTGRES_DB:-indusense}?sslmode=disable
       ANOMALY_DETECTOR_PORT: "8083"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       kafka:
         condition: service_healthy
@@ -263,6 +266,7 @@ services:
       KAFKA_TOPIC_DEAD_LETTER: ${KAFKA_TOPIC_DEAD_LETTER:-dead-letter}
       ALERT_POSTGRES_DSN: postgres://${POSTGRES_USER:-indusense}:${POSTGRES_PASSWORD:-indusense_dev_password}@postgres:5432/${POSTGRES_DB:-indusense}?sslmode=disable
       ALERT_SERVICE_PORT: "8084"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       kafka:
         condition: service_healthy
@@ -302,6 +306,7 @@ services:
       JWT_ACCESS_TTL_MINUTES: ${JWT_ACCESS_TTL_MINUTES:-15}
       JWT_REFRESH_TTL_HOURS: ${JWT_REFRESH_TTL_HOURS:-168}
       API_CORS_ALLOWED_ORIGINS: ${API_CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     depends_on:
       postgres:
         condition: service_healthy
@@ -316,6 +321,51 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    logging: *default-logging
+    networks: [indusense-net]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: indusense-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    logging: *default-logging
+    networks: [indusense-net]
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: indusense-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infrastructure/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    logging: *default-logging
+    networks: [indusense-net]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: indusense-jaeger
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
     logging: *default-logging
     networks: [indusense-net]
 
@@ -375,3 +425,5 @@ volumes:
   kafka-data:
   influxdb-data:
   influxdb-config:
+  prometheus-data:
+  grafana-data:

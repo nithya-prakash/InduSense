@@ -79,6 +79,35 @@ type DeadLetterRecord struct {
 	SourceTopic     string    `json:"source_topic"`
 }
 
+// AnomalyDetected is published on anomalies.detected by the anomaly
+// detector. Severity/Score are the worst across whichever detection
+// method(s) fired for this event; Methods lists all of them so downstream
+// consumers (and humans) can see the full picture, not just the headline.
+type AnomalyDetected struct {
+	AnomalyID        string    `json:"anomaly_id"`
+	EventID          string    `json:"event_id"`
+	OrganizationID   string    `json:"organization_id"`
+	FactoryID        string    `json:"factory_id"`
+	ProductionLineID string    `json:"production_line_id"`
+	MachineID        string    `json:"machine_id"`
+	DeviceID         string    `json:"device_id"`
+	SensorID         string    `json:"sensor_id"`
+	Metric           string    `json:"metric"`
+	Value            float64   `json:"value"`
+	Severity         string    `json:"severity"`
+	Score            float64   `json:"score"`
+	Methods          []string  `json:"methods"`
+	Reason           string    `json:"reason"`
+	DetectedAt       time.Time `json:"detected_at"`
+}
+
+const (
+	SeverityInfo     = "INFO"
+	SeverityWarning  = "WARNING"
+	SeverityHigh     = "HIGH"
+	SeverityCritical = "CRITICAL"
+)
+
 const SchemaVersion = 1
 
 const (

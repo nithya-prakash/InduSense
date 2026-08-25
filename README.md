@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 5 of 18 (Streaming) complete.** This README will be
+> **Status: Phase 6 of 18 (Anomaly Detection) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -259,13 +259,50 @@ curl localhost:8082/ready     # false if Redis is unreachable or the InfluxDB br
 curl localhost:8082/metrics   # messages_consumed/failed_total, duplicate_events_total, kafka_consumer_lag, windowed_aggregates_written_total
 ```
 
-Not yet built: anomaly detection, alerting, incidents, auth/RBAC
+## Current status (Phase 6 — Anomaly Detection)
+
+[services/anomaly-detector](services/anomaly-detector/) consumes
+`telemetry.processed` and runs three independent detection levels on every
+reading, publishing a combined result to `anomalies.detected` when any
+fire. Full design writeup, including an honest evaluation of the Isolation
+Forest (what was measured vs. not), is in
+[docs/ANOMALY-DETECTION.md](docs/ANOMALY-DETECTION.md).
+
+All three levels were verified firing on live data in a single test run:
+
+```text
+anomalies_detected_total{method="RULE"}              122
+anomalies_detected_total{method="STATISTICAL"}          8
+anomalies_detected_total{method="ISOLATION_FOREST"}     1
+```
+
+- **Rule-based**: value outside the sensor's seeded operating range, severity
+  scaled by overshoot fraction.
+- **Statistical**: EWMA rolling mean/stddev per `(device_id, metric)`,
+  z-score against the pre-sample baseline, suppressed until 30+ samples.
+- **Isolation Forest**: a real implementation (not a wrapped library) of
+  Liu, Ting & Zhou (2008) — verified with a synthetic-data evaluation
+  showing normal points scoring 0.45 vs. outliers scoring 0.68 on average
+  (both correctly on their expected side of the 0.6 anomaly threshold). One
+  forest is trained **per machine type**, not globally, because different
+  machine types report different metric sets — a CNC mill's feature vector
+  isn't the same shape or semantics as a hydraulic press's, so a shared
+  forest would compare incomparable dimensions. All 5 machine-type forests
+  trained successfully from live data in the deployment's first retrain
+  cycle (`ANOMALY_FOREST_RETRAIN_SECONDS`, default 120s).
+
+```bash
+curl localhost:8083/forests    # which machine types currently have a trained forest
+curl localhost:8083/metrics    # anomalies_detected_total{method}, isolation_forests_trained_total
+```
+
+Not yet built: alerting, incidents, auth/RBAC
 enforcement, REST/WS API, frontend, Grafana/Jaeger, Kubernetes manifests,
 CI/CD, and most formal testing (tests so far are unit tests for pure logic
-in the simulator, ingestion, and stream-processor services — the live
-MQTT/Kafka/Redis/InfluxDB verification above was done manually against real
-infra, not yet captured as a permanent automated test; that lands in
-Phase 13). These land in Phases 6–18.
+in the simulator, ingestion, stream-processor, and anomaly-detector
+services — the live MQTT/Kafka/Redis/InfluxDB/Postgres verification above
+was done manually against real infra, not yet captured as a permanent
+automated test; that lands in Phase 13). These land in Phases 7–18.
 
 ## Local setup
 

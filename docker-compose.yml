@@ -217,6 +217,36 @@ services:
     logging: *default-logging
     networks: [indusense-net]
 
+  anomaly-detector:
+    build:
+      context: .
+      dockerfile: services/anomaly-detector/Dockerfile
+    container_name: indusense-anomaly-detector
+    ports:
+      - "8083:8083"
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_CONSUMER_GROUP_PREFIX: ${MQTT_CLIENT_ID_PREFIX:-indusense}
+      KAFKA_TOPIC_TELEMETRY_PROCESSED: ${KAFKA_TOPIC_TELEMETRY_PROCESSED:-telemetry.processed}
+      KAFKA_TOPIC_ANOMALIES_DETECTED: ${KAFKA_TOPIC_ANOMALIES_DETECTED:-anomalies.detected}
+      KAFKA_TOPIC_DEAD_LETTER: ${KAFKA_TOPIC_DEAD_LETTER:-dead-letter}
+      ANOMALY_POSTGRES_DSN: postgres://${POSTGRES_USER:-indusense}:${POSTGRES_PASSWORD:-indusense_dev_password}@postgres:5432/${POSTGRES_DB:-indusense}?sslmode=disable
+      ANOMALY_DETECTOR_PORT: "8083"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init-topics:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8083/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *default-logging
+    networks: [indusense-net]
+
   # ---------------------------------------------------------------------------
   # Sensor simulator — on-demand only (not part of `docker compose up`).
   # Run with `make simulate` or `docker compose --profile simulate up simulator`.

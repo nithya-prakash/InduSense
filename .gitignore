@@ -1,8 +1,15 @@
 .env
 *.log
 
-# Go
+# Go — `go build ./...` from repo root drops one binary per main package here,
+# named after its directory (seed, api, ingestion, stream-processor, ...).
 /bin/
+/seed
+/api
+/ingestion
+/stream-processor
+/anomaly-detector
+/alert-service
 *.test
 *.out
 vendor/

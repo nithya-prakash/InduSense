@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 13 of 18 (Testing) complete.** This README will be
+> **Status: Phase 14 of 18 (Kubernetes + Helm) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -743,6 +743,122 @@ counts as if they meant something they don't. Kubernetes manifests, CI/CD,
 and load testing (Makefile's `load-test` target already names itself
 Phase 15) land in the remaining phases.
 
+## Current status (Phase 14 — Kubernetes + Helm)
+
+[infrastructure/helm/indusense/](infrastructure/helm/indusense/) is a Helm
+chart that deploys the entire stack — every StatefulSet, Deployment, and
+one-time setup Job docker-compose.yml already defines — as a single
+release, without changing a line of application code: every Go service's
+`config.go` just reads environment variables, and doesn't know or care
+whether Compose or Kubernetes set them.
+
+**Verified against a real cluster, start to finish**, not `helm template`
+alone: Docker Desktop's Kubernetes (kind-based, 1 node), a completely fresh
+`helm install --set seed.enabled=true` converging to all 15 pods `Running`
+in **66 seconds wall-clock**, real demo data landing in Postgres (2 orgs, 6
+users, 200 devices, 1000 sensors — via the same `scripts/seed` binary,
+rebuilt as a container image for the first time this phase), a real login
+returning a genuine JWT through a `kubectl port-forward`'d API, and —
+firing the in-cluster simulator Job — the full pipeline processing real
+traffic: stream-processor consuming 1734 messages, anomaly-detector
+detecting 131 anomalies and generating 26 real alerts (8 CRITICAL / 13 HIGH
+/ 5 WARNING) with genuine reasoning text ("value 90.64 outside safe
+operating range [20.00, 90.00]; z-score 3.80 exceeds threshold 3.00..."),
+all visible through the actual API. Grafana came up with all 4 dashboards
+provisioned from the same JSON as Compose, Prometheus showed all 5 Go
+services `up`, and Jaeger recorded real traces from all 5 — proving Phase
+12's observability stack works identically under Kubernetes DNS names with
+zero code changes.
+
+**Three real bugs were found and fixed by actually deploying, not by
+reading the YAML:**
+
+1. **Kafka wouldn't start: a headless-Service DNS chicken-and-egg.** Kafka's
+   own KRaft controller-registration step needs to resolve its advertised
+   name (`indusense-kafka:9093`) *during startup, before the broker is
+   Ready* — but a headless Service excludes not-yet-Ready pods from DNS by
+   default, so the broker could never resolve itself and crash-looped
+   forever. Fixed with `publishNotReadyAddresses: true` on Kafka's Service,
+   the standard fix for this exact problem in self-registering StatefulSet
+   members (Kafka, Cassandra, etcd, ZooKeeper all hit it).
+2. **Kafka's health probes always failed, even once healthy.**
+   `kafka-broker-api-versions.sh` boots a fresh JVM on every invocation —
+   routinely well over Kubernetes' 1-second default probe timeout. Fixed
+   with an explicit `timeoutSeconds: 10`.
+3. **LoadBalancer Services never got an external IP, and worse, blocked
+   `helm uninstall`.** Docker Desktop's Kubernetes is kind-based with no
+   cloud-provider-kind/MetalLB, so `api`/`frontend`'s LoadBalancer Services
+   sat at `<pending>` forever — and their
+   `service.kubernetes.io/load-balancer-cleanup` finalizer then blocked
+   namespace deletion until manually patched off. Switched the default to
+   `ClusterIP` + `kubectl port-forward`; a NodePort was the other option,
+   but its 30000-32767 range can't reproduce port 8080, which the frontend
+   image already has `NEXT_PUBLIC_API_BASE_URL=http://localhost:8080` baked
+   into at build time (Next.js inlines `NEXT_PUBLIC_*` vars into the client
+   bundle) — forcing a rebuild just for Kubernetes would have broken the
+   one-image-both-substrates property this chart was designed around.
+
+**A fourth issue was observed, not chart-level, and resolved itself:** on
+the very first install (before the Kafka probe-timeout fix), Kafka's own
+instability during startup left `stream-processor`'s Kafka reader
+genuinely stuck — joined its consumer group, then never issued another
+fetch, with `messages_consumed_total` stuck at 0 even though the topic had
+over a thousand real messages waiting. A pod restart immediately fixed it.
+Re-tested after the probe fix, across a completely fresh install with no
+manual intervention: the pipeline processed traffic correctly on the first
+try. The stuck reader was very likely a downstream symptom of Kafka's own
+instability, not an independent bug — but a production hardening step
+worth naming honestly: a liveness check tied to consumer progress (not
+just process-alive) would catch this class of failure without a human
+watching metrics.
+
+**Migrations and topic creation as Helm hooks**
+([templates/jobs-migrate.yaml](infrastructure/helm/indusense/templates/jobs-migrate.yaml),
+[templates/jobs-kafka-topics.yaml](infrastructure/helm/indusense/templates/jobs-kafka-topics.yaml))
+run `post-install,pre-upgrade` — deliberately not `pre-install`, which was
+the first thing tried and immediately failed: a pre-install hook runs
+*before* the release's own Postgres/Kafka StatefulSets exist, so the
+migration Job's wait-for-postgres initContainer had nothing to poll.
+Migrations get baked into a small custom image
+([infrastructure/docker/migrate/Dockerfile](infrastructure/docker/migrate/Dockerfile))
+rather than mounted from a ConfigMap — a 1MiB size limit and decoupling the
+schema from the image that applies it are both real problems a ConfigMap
+would have created. The Kafka topics script, at under 30 lines, doesn't
+carry that argument and is mounted from a ConfigMap instead.
+
+**Demo data seeding**
+([templates/jobs-seed.yaml](infrastructure/helm/indusense/templates/jobs-seed.yaml))
+reuses `scripts/seed` unmodified, containerized for the first time this
+phase. It's a `post-install,post-upgrade` hook, off by default
+(`seed.enabled=false`) — the first version was `post-install`-only, which
+seemed like the more disciplined choice (why reseed an already-seeded
+database on every upgrade?) until it became clear that also meant the
+documented way to seed *after* the fact — `helm upgrade --set
+seed.enabled=true` — silently did nothing, since post-install hooks never
+fire on upgrades. `scripts/seed` was already fully idempotent from Phase
+1, so the fix cost nothing: add `post-upgrade` too.
+
+**Traffic generation runs inside the cluster**
+([templates/jobs-simulator.yaml](infrastructure/helm/indusense/templates/jobs-simulator.yaml)),
+unlike Compose's simulator profile, which runs from the host machine. This
+isn't a shortcut — it's a real constraint: Kafka's advertised listener only
+resolves inside the cluster (see bug #1's fix), so a client outside it
+would get broker metadata pointing at a hostname it can't reach. The Job is
+bounded with `activeDeadlineSeconds` rather than a duration flag, since the
+simulator binary itself has none — it normally runs until SIGTERM, exactly
+like the Compose version.
+
+**Not implemented in this phase**: an ingress controller/Ingress resource
+(written and gated behind `ingress.enabled=false`, since Docker Desktop's
+Kubernetes has none installed by default — untested against a real one);
+Kafka/Postgres clustering or multi-replica stateful components (every
+StatefulSet stays at 1 replica, matching docker-compose's topology exactly
+rather than pretending this chart does something it doesn't); Horizontal
+Pod Autoscaling; NetworkPolicies. `api` runs 2 replicas behind its Service
+as the one genuinely meaningful horizontal-scaling demonstration, since
+it's the only stateless service worth the point. These, along with CI/CD
+and load testing, land in the remaining phases.
+
 ## Local setup
 
 ```bash
@@ -765,6 +881,32 @@ Demo users (`make seed`), one per role, password `ChangeMe123!` for all —
 `viewer@musterfabrik-gmbh.de`. A second organization
 (`admin@zweite-firma-gmbh.de`, same password) exists specifically for
 multi-tenancy testing.
+
+### Alternative: Kubernetes + Helm
+
+Same demo users/password as above. Requires a local cluster (Docker
+Desktop's Kubernetes, minikube, or kind) and the app images already built
+locally (`make up` builds them, or `docker compose build`):
+
+```bash
+docker build -t indusense-migrate:latest -f infrastructure/docker/migrate/Dockerfile .
+docker build -t indusense-seed:latest -f scripts/seed/Dockerfile .
+
+helm install indusense infrastructure/helm/indusense \
+  --create-namespace -n indusense --set seed.enabled=true
+
+kubectl get pods -n indusense
+kubectl port-forward -n indusense svc/indusense-api 8080:8080 &
+kubectl port-forward -n indusense svc/indusense-frontend 3000:3000 &
+```
+
+To generate traffic (has to run as a pod — see the Phase 14 section above
+for why):
+
+```bash
+helm upgrade indusense infrastructure/helm/indusense -n indusense \
+  --reuse-values --set simulator.enabled=true
+```
 
 ## Repository structure
 

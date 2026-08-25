@@ -1,0 +1,31 @@
+InduSense is deploying (or has deployed) as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Check status:
+  kubectl get pods -n {{ .Release.Namespace }}
+
+{{- if eq .Values.api.service.type "LoadBalancer" }}
+The API and dashboard are exposed as LoadBalancer Services. Docker Desktop's
+Kubernetes maps these straight to localhost:
+  API:       http://localhost:{{ .Values.api.service.port }}
+  Dashboard: http://localhost:{{ .Values.frontend.service.port }}
+{{- else }}
+Reach the API and dashboard with port-forward:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ .Release.Name }}-api {{ .Values.api.service.port }}:{{ .Values.api.service.port }}
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ .Release.Name }}-frontend {{ .Values.frontend.service.port }}:{{ .Values.frontend.service.port }}
+{{- end }}
+
+Observability tooling (operator-only, not exposed by default):
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ .Release.Name }}-grafana 3001:3000
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ .Release.Name }}-prometheus 9090:9090
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ .Release.Name }}-jaeger 16686:16686
+
+{{- if not .Values.seed.enabled }}
+
+No demo data was seeded (seed.enabled=false). To seed it:
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set seed.enabled=true -n {{ .Release.Namespace }}
+{{- end }}
+
+To generate real MQTT/Kafka traffic against this deployment:
+  helm upgrade {{ .Release.Name }} <chart> --reuse-values --set simulator.enabled=true -n {{ .Release.Namespace }}
+(Kafka's advertised listener only resolves inside the cluster, so this has
+to run as a pod — see templates/jobs-simulator.yaml.)

@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-influxdb
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "influxdb") | nindent 4 }}
+spec:
+  serviceName: {{ .Release.Name }}-influxdb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "indusense.selectorLabels" (dict "root" $ "name" "influxdb") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "influxdb") | nindent 8 }}
+    spec:
+      containers:
+        - name: influxdb
+          image: {{ .Values.influxdb.image }}
+          ports:
+            - containerPort: 8086
+          env:
+            - name: DOCKER_INFLUXDB_INIT_MODE
+              value: setup
+            - name: DOCKER_INFLUXDB_INIT_USERNAME
+              value: {{ .Values.influxdb.adminUser | quote }}
+            - name: DOCKER_INFLUXDB_INIT_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Release.Name }}-secrets, key: INFLUXDB_ADMIN_PASSWORD }
+            - name: DOCKER_INFLUXDB_INIT_ORG
+              value: {{ .Values.influxdb.org | quote }}
+            - name: DOCKER_INFLUXDB_INIT_BUCKET
+              value: {{ .Values.influxdb.bucket | quote }}
+            - name: DOCKER_INFLUXDB_INIT_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: { name: {{ .Release.Name }}-secrets, key: INFLUXDB_TOKEN }
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/influxdb2
+            - name: config
+              mountPath: /etc/influxdb2
+          readinessProbe:
+            httpGet: { path: /health, port: 8086 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: 8086 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.influxdb.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.influxdb.storageSize }}
+    - metadata:
+        name: config
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-influxdb
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "influxdb") | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "indusense.selectorLabels" (dict "root" $ "name" "influxdb") | nindent 4 }}
+  ports:
+    - port: 8086
+      targetPort: 8086

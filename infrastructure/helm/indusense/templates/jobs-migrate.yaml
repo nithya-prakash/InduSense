@@ -1,0 +1,54 @@
+{{- if .Values.migrate.enabled }}
+# post-install, not pre-install: a pre-install hook runs before ANY of the
+# release's normal resources exist, including the Postgres StatefulSet
+# itself, so the wait-for-postgres initContainer below would poll a host
+# that doesn't exist yet and the hook would fail outright. post-install
+# hooks run after Helm has submitted the normal manifests (Postgres
+# included) to the API server — the initContainer then does the real
+# waiting, for the pod to actually become reachable, not just declared.
+#
+# pre-upgrade (not post-upgrade) on upgrades, deliberately different from
+# install: by then Postgres already exists and is running from the prior
+# release, so it's safe — and correct — to apply schema changes before the
+# upgraded app pods (which may depend on them) start.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-migrate-{{ .Release.Revision }}
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "migrate") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "migrate") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image }}
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h {{ .Release.Name }}-postgres -U {{ .Values.postgres.user }} -d {{ .Values.postgres.db }}; do
+                echo "waiting for postgres..."
+                sleep 2
+              done
+      containers:
+        - name: migrate
+          image: "{{ .Values.images.migrate.repository }}:{{ .Values.images.migrate.tag }}"
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args:
+            - "-database"
+            - "$(POSTGRES_DSN)"
+            - "up"
+          env:
+            - name: POSTGRES_DSN
+              value: {{ include "indusense.postgresDSN" . | quote }}
+{{- end }}

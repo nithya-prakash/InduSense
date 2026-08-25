@@ -1,0 +1,32 @@
+{{- if .Values.ingress.enabled }}
+# Off by default: Docker Desktop's Kubernetes has no ingress controller
+# out of the box, and the LoadBalancer Services on api/frontend already
+# cover local access. Turn this on for a cluster that has ingress-nginx
+# (or similar) installed.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Release.Name }}
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "ingress") | nindent 4 }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600" # /ws/alerts needs a long-lived connection
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-api
+                port: { number: {{ .Values.api.service.port }} }
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Release.Name }}-frontend
+                port: { number: {{ .Values.frontend.service.port }} }
+{{- end }}

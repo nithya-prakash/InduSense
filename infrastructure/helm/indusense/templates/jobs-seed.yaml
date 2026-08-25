@@ -1,0 +1,37 @@
+{{- if .Values.seed.enabled }}
+# post-install AND post-upgrade: seed.enabled defaults to false, so this
+# Job only ever renders at all when a `helm install`/`helm upgrade`
+# explicitly turns it on — post-install-only was tried first, but that
+# silently does nothing on `helm upgrade --set seed.enabled=true` against
+# an already-installed release (post-install hooks never fire on
+# upgrades), which is the actual documented way to seed after the fact
+# (see NOTES.txt). scripts/seed is fully idempotent, so the cost of also
+# firing on every subsequent upgrade that happens to still have
+# seed.enabled=true (Helm persists --set values across upgrades unless
+# reset) is just a harmless few-hundred-millisecond no-op Job.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-seed-{{ .Release.Revision }}
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "seed") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "1" # after kafka-topics (weight 0), though seed itself only needs postgres
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "seed") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: seed
+          image: "{{ .Values.images.seed.repository }}:{{ .Values.images.seed.tag }}"
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - name: SEED_POSTGRES_DSN
+              value: {{ include "indusense.postgresDSN" . | quote }}
+{{- end }}

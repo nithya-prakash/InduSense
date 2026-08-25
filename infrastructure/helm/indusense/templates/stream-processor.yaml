@@ -1,0 +1,73 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-stream-processor
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "stream-processor") | nindent 4 }}
+spec:
+  replicas: {{ .Values.services.streamProcessor.replicas }}
+  selector:
+    matchLabels:
+      {{- include "indusense.selectorLabels" (dict "root" $ "name" "stream-processor") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "stream-processor") | nindent 8 }}
+    spec:
+      containers:
+        - name: stream-processor
+          image: "{{ .Values.images.streamProcessor.repository }}:{{ .Values.images.streamProcessor.tag }}"
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          ports:
+            - containerPort: 8082
+          env:
+            - name: KAFKA_BROKERS
+              value: "{{ .Release.Name }}-kafka:9092"
+            - name: KAFKA_CONSUMER_GROUP_PREFIX
+              value: {{ .Values.kafkaTopics.clientIDPrefix | quote }}
+            - name: KAFKA_TOPIC_TELEMETRY_RAW
+              value: {{ .Values.kafkaTopics.telemetryRaw | quote }}
+            - name: KAFKA_TOPIC_TELEMETRY_PROCESSED
+              value: {{ .Values.kafkaTopics.telemetryProcessed | quote }}
+            - name: KAFKA_TOPIC_DEAD_LETTER
+              value: {{ .Values.kafkaTopics.deadLetter | quote }}
+            - name: REDIS_HOST
+              value: "{{ .Release.Name }}-redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: INFLUXDB_URL
+              value: "http://{{ .Release.Name }}-influxdb:8086"
+            - name: INFLUXDB_TOKEN
+              valueFrom:
+                secretKeyRef: { name: {{ .Release.Name }}-secrets, key: INFLUXDB_TOKEN }
+            - name: INFLUXDB_ORG
+              value: {{ .Values.influxdb.org | quote }}
+            - name: INFLUXDB_BUCKET
+              value: {{ .Values.influxdb.bucket | quote }}
+            - name: STREAM_PROCESSOR_PORT
+              value: "8082"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://{{ .Release.Name }}-jaeger:4318"
+          readinessProbe:
+            httpGet: { path: /ready, port: 8082 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /live, port: 8082 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.services.streamProcessor.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-stream-processor
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "stream-processor") | nindent 4 }}
+spec:
+  selector:
+    {{- include "indusense.selectorLabels" (dict "root" $ "name" "stream-processor") | nindent 4 }}
+  ports:
+    - port: 8082
+      targetPort: 8082

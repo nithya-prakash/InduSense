@@ -1,0 +1,120 @@
+# Single-broker Kafka in KRaft mode (no ZooKeeper), same image and mode as
+# docker-compose.yml. Unlike Compose, there's no EXTERNAL listener for
+# host-machine access: a client outside the cluster that connects via
+# port-forward would receive this broker's metadata advertising
+# "{{ .Release.Name }}-kafka:9092", a name that only resolves inside the
+# cluster, and fail to reconnect — a well-known Kafka-on-Kubernetes trap.
+# Traffic generation against this cluster's Kafka is meant to run from
+# inside the cluster (see jobs-simulator.yaml), not from the host.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-kafka
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "kafka") | nindent 4 }}
+spec:
+  serviceName: {{ .Release.Name }}-kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "indusense.selectorLabels" (dict "root" $ "name" "kafka") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "kafka") | nindent 8 }}
+    spec:
+      containers:
+        - name: kafka
+          image: {{ .Values.kafka.image }}
+          ports:
+            - containerPort: 9092
+            - containerPort: 9093
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: broker,controller
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://{{ .Release.Name }}-kafka:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: CONTROLLER
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@{{ .Release.Name }}-kafka:9093"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: PLAINTEXT
+            - name: CLUSTER_ID
+              value: SGpTVXBRVE8yc2hSXzFDQg
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "false"
+            - name: KAFKA_NUM_PARTITIONS
+              value: "12"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+          # kafka-broker-api-versions.sh boots a fresh JVM on every invocation
+          # — routinely well over the 1s default probe timeout, which made
+          # this permanently "Unhealthy" (command timed out after 1s) even
+          # once the broker itself was fully up. timeoutSeconds needs to be
+          # generous, not periodSeconds/failureThreshold.
+          readinessProbe:
+            exec:
+              command: ["/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 10
+          livenessProbe:
+            exec:
+              command: ["/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.kafka.resources | nindent 12 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.kafka.storageSize }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-kafka
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "kafka") | nindent 4 }}
+spec:
+  clusterIP: None
+  # Without this, a headless Service excludes a pod from DNS resolution
+  # until that pod is Ready — but Kafka's own KRaft controller-registration
+  # step (during startup, before the broker API is even listening) needs
+  # to resolve its own advertised name ("indusense-kafka:9093") to register
+  # itself with the controller quorum. That's a real chicken-and-egg: not
+  # Ready yet -> not in DNS -> can't complete the startup step that would
+  # make it Ready. publishNotReadyAddresses publishes the pod's DNS record
+  # regardless of readiness, which is exactly what self-registering
+  # StatefulSet members (Kafka, Cassandra, etcd, ZooKeeper) need.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "indusense.selectorLabels" (dict "root" $ "name" "kafka") | nindent 4 }}
+  ports:
+    - name: plaintext
+      port: 9092
+      targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093

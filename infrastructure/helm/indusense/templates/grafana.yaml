@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-grafana-provisioning
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+data:
+  datasource.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://{{ .Release.Name }}-prometheus:9090
+        isDefault: true
+        editable: false
+      - name: Jaeger
+        type: jaeger
+        access: proxy
+        url: http://{{ .Release.Name }}-jaeger:16686
+        editable: false
+  dashboards.yml: |
+    apiVersion: 1
+    providers:
+      - name: InduSense
+        orgId: 1
+        folder: InduSense
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 30
+        options:
+          path: /var/lib/grafana/dashboards
+---
+# The dashboard JSON itself is identical to docker-compose's — same panels,
+# same PromQL, same `job` label values — because prometheus.yaml (this
+# chart) kept the same job_name per service. infrastructure/helm's
+# files/grafana-dashboards is a symlink to infrastructure/grafana/dashboards
+# so that identity is enforced, not just claimed: there's exactly one copy
+# of each dashboard JSON in the repo.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-grafana-dashboards
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+data:
+  {{- range $path, $_ := .Files.Glob "files/grafana-dashboards/*.json" }}
+  {{ base $path }}: |
+    {{- $.Files.Get $path | nindent 4 }}
+  {{- end }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+spec:
+  serviceName: {{ .Release.Name }}-grafana
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "indusense.selectorLabels" (dict "root" $ "name" "grafana") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "grafana") | nindent 8 }}
+    spec:
+      containers:
+        - name: grafana
+          image: {{ .Values.grafana.image }}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: {{ .Values.grafana.adminUser | quote }}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Release.Name }}-secrets, key: GRAFANA_ADMIN_PASSWORD }
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: Viewer
+          volumeMounts:
+            - name: provisioning-datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: provisioning-dashboards
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+            - name: data
+              mountPath: /var/lib/grafana
+          readinessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /api/health, port: 3000 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.grafana.resources | nindent 12 }}
+      volumes:
+        - name: provisioning-datasources
+          configMap:
+            name: {{ .Release.Name }}-grafana-provisioning
+            items:
+              - { key: datasource.yml, path: datasource.yml }
+        - name: provisioning-dashboards
+          configMap:
+            name: {{ .Release.Name }}-grafana-provisioning
+            items:
+              - { key: dashboards.yml, path: dashboards.yml }
+        - name: dashboards
+          configMap:
+            name: {{ .Release.Name }}-grafana-dashboards
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.grafana.storageSize }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-grafana
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "grafana") | nindent 4 }}
+spec:
+  # Plain ClusterIP, not headless: nothing needs per-pod DNS here, and this
+  # is the natural target for `kubectl port-forward` — Grafana/Prometheus/
+  # Jaeger are operator tooling, not part of the product surface, so unlike
+  # api/frontend they aren't exposed as LoadBalancer by default.
+  selector:
+    {{- include "indusense.selectorLabels" (dict "root" $ "name" "grafana") | nindent 4 }}
+  ports:
+    - port: 3000
+      targetPort: 3000

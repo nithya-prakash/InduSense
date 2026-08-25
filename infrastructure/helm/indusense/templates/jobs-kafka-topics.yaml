@@ -1,0 +1,84 @@
+# Same topic set as infrastructure/docker/kafka-init-topics.sh, run as a
+# post-install/post-upgrade hook rather than baked into a custom image
+# like the migration Job — a ~30-line shell script well under the
+# ConfigMap size limit doesn't carry the same "versioned schema" argument
+# a SQL migration directory does.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-kafka-topics-script
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "kafka-topics") | nindent 4 }}
+data:
+  kafka-init-topics.sh: |
+    #!/bin/bash
+    set -e
+
+    BOOTSTRAP="{{ .Release.Name }}-kafka:9092"
+
+    create_topic() {
+      local topic="$1"
+      local partitions="$2"
+      echo "Creating topic: ${topic} (partitions=${partitions})"
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" \
+        --create --if-not-exists --topic "${topic}" \
+        --partitions "${partitions}" --replication-factor 1
+    }
+
+    create_topic "{{ .Values.kafkaTopics.telemetryRaw }}" 12
+    create_topic "{{ .Values.kafkaTopics.telemetryProcessed }}" 12
+    create_topic "{{ .Values.kafkaTopics.anomaliesDetected }}" 6
+    create_topic "{{ .Values.kafkaTopics.alerts }}" 6
+    create_topic "incidents" 3
+    create_topic "{{ .Values.kafkaTopics.deviceEvents }}" 3
+    create_topic "audit.events" 3
+    create_topic "{{ .Values.kafkaTopics.deadLetter }}" 3
+
+    echo "Topics created:"
+    /opt/kafka/bin/kafka-topics.sh --bootstrap-server "${BOOTSTRAP}" --list
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-kafka-topics-{{ .Release.Revision }}
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "kafka-topics") | nindent 4 }}
+  annotations:
+    # post-install (not pre-install, for the same reason as
+    # jobs-migrate.yaml: Kafka doesn't exist yet during pre-install) and
+    # pre-upgrade (so any new topic a chart upgrade introduces exists
+    # before the upgraded app pods start producing/consuming to it).
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "kafka-topics") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-kafka
+          image: {{ .Values.kafka.image }}
+          command:
+            - bash
+            - -c
+            - |
+              until /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server {{ .Release.Name }}-kafka:9092; do
+                echo "waiting for kafka..."
+                sleep 3
+              done
+      containers:
+        - name: kafka-topics
+          image: {{ .Values.kafka.image }}
+          command: ["/bin/bash", "/scripts/kafka-init-topics.sh"]
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+      volumes:
+        - name: script
+          configMap:
+            name: {{ .Release.Name }}-kafka-topics-script
+            defaultMode: 0755

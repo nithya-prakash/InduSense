@@ -1,0 +1,40 @@
+{{- if .Values.simulator.enabled }}
+# Not a Helm lifecycle hook — this Job is meant to be fired on demand
+# (`helm upgrade --set simulator.enabled=true`) to generate real traffic
+# against the in-cluster MQTT/Kafka/Postgres, the K8s equivalent of
+# `make simulate`. It can't run from the host machine the way Compose's
+# simulator does: Kafka's advertised listener only resolves inside the
+# cluster (see kafka.yaml), so the simulator has to run as a pod too.
+# activeDeadlineSeconds bounds it, since the simulator itself has no
+# built-in duration flag — it normally runs until SIGTERM.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-simulator-{{ .Release.Revision }}
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "simulator") | nindent 4 }}
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.simulator.durationSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "simulator") | nindent 8 }}
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: simulator
+          image: "{{ .Values.images.simulator.repository }}:{{ .Values.images.simulator.tag }}"
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - name: SIM_POSTGRES_DSN
+              value: {{ include "indusense.postgresDSN" . | quote }}
+            - name: SIM_MQTT_BROKER_URL
+              value: "tcp://{{ .Release.Name }}-mosquitto:1883"
+            - name: SENSOR_COUNT
+              value: {{ .Values.simulator.sensorCount | quote }}
+            - name: MESSAGES_PER_SECOND
+              value: {{ .Values.simulator.messagesPerSecond | quote }}
+            - name: ANOMALY_RATE
+              value: {{ .Values.simulator.anomalyRate | quote }}
+{{- end }}

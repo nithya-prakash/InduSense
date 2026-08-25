@@ -1,0 +1,11 @@
+apiVersion: v2
+name: indusense
+description: >-
+  InduSense — Industrial IoT Monitoring Platform. Deploys the full
+  event-driven stack (MQTT, Kafka, Postgres, InfluxDB, Redis, the five Go
+  services, the Next.js dashboard, and Prometheus/Grafana/Jaeger) as a
+  single release, mirroring docker-compose.yml's topology one-to-one so the
+  two deployment substrates never drift into different architectures.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

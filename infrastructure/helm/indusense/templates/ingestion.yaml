@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-ingestion
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "ingestion") | nindent 4 }}
+spec:
+  replicas: {{ .Values.services.ingestion.replicas }}
+  selector:
+    matchLabels:
+      {{- include "indusense.selectorLabels" (dict "root" $ "name" "ingestion") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "indusense.labels" (dict "root" $ "name" "ingestion") | nindent 8 }}
+    spec:
+      containers:
+        - name: ingestion
+          image: "{{ .Values.images.ingestion.repository }}:{{ .Values.images.ingestion.tag }}"
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          ports:
+            - containerPort: 8081
+          env:
+            - name: MQTT_BROKER_HOST
+              value: "{{ .Release.Name }}-mosquitto"
+            - name: MQTT_BROKER_PORT
+              value: "1883"
+            - name: MQTT_CLIENT_ID_PREFIX
+              value: {{ .Values.kafkaTopics.clientIDPrefix | quote }}
+            - name: KAFKA_BROKERS
+              value: "{{ .Release.Name }}-kafka:9092"
+            - name: KAFKA_TOPIC_TELEMETRY_RAW
+              value: {{ .Values.kafkaTopics.telemetryRaw | quote }}
+            - name: KAFKA_TOPIC_DEVICE_EVENTS
+              value: {{ .Values.kafkaTopics.deviceEvents | quote }}
+            - name: KAFKA_TOPIC_DEAD_LETTER
+              value: {{ .Values.kafkaTopics.deadLetter | quote }}
+            - name: INGESTION_PORT
+              value: "8081"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://{{ .Release.Name }}-jaeger:4318"
+          readinessProbe:
+            httpGet: { path: /ready, port: 8081 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /live, port: 8081 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.services.ingestion.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-ingestion
+  labels:
+    {{- include "indusense.labels" (dict "root" $ "name" "ingestion") | nindent 4 }}
+spec:
+  selector:
+    {{- include "indusense.selectorLabels" (dict "root" $ "name" "ingestion") | nindent 4 }}
+  ports:
+    - port: 8081
+      targetPort: 8081

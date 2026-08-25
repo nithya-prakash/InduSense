@@ -1,0 +1,178 @@
+# Default values for indusense.
+# This chart intentionally mirrors docker-compose.yml's topology and env
+# var names one-to-one — the Go services' config.go files don't know or
+# care which orchestrator set their environment, so no application code
+# changes were needed to move from Compose to Kubernetes.
+
+# App images are built locally (`docker compose build` or `make up`) and
+# used directly by Docker Desktop's Kubernetes without a registry push —
+# it shares Docker Desktop's own image store. Pushing to a real registry
+# for a non-local cluster only requires changing `repository` here.
+images:
+  pullPolicy: IfNotPresent
+  ingestion: { repository: indusense-ingestion, tag: latest }
+  streamProcessor: { repository: indusense-stream-processor, tag: latest }
+  anomalyDetector: { repository: indusense-anomaly-detector, tag: latest }
+  alertService: { repository: indusense-alert-service, tag: latest }
+  api: { repository: indusense-api, tag: latest }
+  frontend: { repository: indusense-frontend, tag: latest }
+  migrate: { repository: indusense-migrate, tag: latest }
+  seed: { repository: indusense-seed, tag: latest }
+  simulator: { repository: indusense-simulator, tag: latest }
+
+postgres:
+  image: postgres:16-alpine
+  db: indusense
+  user: indusense
+  password: indusense_dev_password # dev only — override via --set for anything real
+  storageSize: 2Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+redis:
+  image: redis:7-alpine
+  storageSize: 512Mi
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+
+influxdb:
+  image: influxdb:2.7-alpine
+  adminUser: admin
+  adminPassword: indusense_dev_password
+  org: indusense
+  bucket: telemetry
+  token: dev-only-influx-admin-token-change-me
+  storageSize: 2Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 1Gi }
+
+mosquitto:
+  image: eclipse-mosquitto:2.0
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 100m, memory: 128Mi }
+
+kafka:
+  image: apache/kafka:3.7.0
+  storageSize: 2Gi
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: 1, memory: 1Gi }
+
+jaeger:
+  image: jaegertracing/all-in-one:1.60
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+
+prometheus:
+  image: prom/prometheus:v2.55.1
+  storageSize: 2Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+grafana:
+  image: grafana/grafana:11.3.1
+  adminUser: admin
+  adminPassword: admin # dev only
+  storageSize: 512Mi
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 250m, memory: 256Mi }
+
+jwt:
+  accessSecret: change-me-dev-only-access-secret
+  refreshSecret: change-me-dev-only-refresh-secret
+  accessTTLMinutes: 15
+  refreshTTLHours: 168
+
+kafkaTopics:
+  clientIDPrefix: indusense
+  telemetryRaw: telemetry.raw
+  telemetryProcessed: telemetry.processed
+  anomaliesDetected: anomalies.detected
+  alerts: alerts
+  deviceEvents: device.events
+  deadLetter: dead-letter
+
+# Each app service's replica count and resource envelope. All five Go
+# services are stateless behind their own ClusterIP Service, so
+# horizontal scaling here is a real, meaningful knob — unlike the
+# StatefulSets above, which stay at 1 replica (this chart doesn't attempt
+# Kafka/Postgres clustering, matching the docker-compose topology it
+# mirrors).
+services:
+  ingestion:
+    replicas: 1
+    resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: 250m, memory: 128Mi } }
+  streamProcessor:
+    replicas: 1
+    resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: 250m, memory: 128Mi } }
+  anomalyDetector:
+    replicas: 1
+    resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: 250m, memory: 128Mi } }
+  alertService:
+    replicas: 1
+    resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: 250m, memory: 128Mi } }
+  api:
+    replicas: 2 # the one service actually worth demonstrating horizontal scaling on — stateless, load-balanced by its Service
+    resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { cpu: 250m, memory: 128Mi } }
+  frontend:
+    replicas: 1
+    resources: { requests: { cpu: 25m, memory: 64Mi }, limits: { cpu: 150m, memory: 128Mi } }
+
+# api and frontend are the only two components meant to be reachable from
+# outside the cluster. Default is ClusterIP + `kubectl port-forward`: tried
+# LoadBalancer first, but Docker Desktop's Kubernetes (kind-based, no
+# cloud-provider-kind/MetalLB installed) never assigns an EXTERNAL-IP —
+# the Service sits at <pending> forever, and worse, its
+# service.kubernetes.io/load-balancer-cleanup finalizer then blocks
+# `helm uninstall`/namespace deletion from ever completing. NodePort was
+# the other option, but its 30000-32767 range can't reproduce port 8080,
+# which the frontend image has NEXT_PUBLIC_API_BASE_URL=http://localhost:8080
+# baked into at build time (Next.js inlines NEXT_PUBLIC_* into the client
+# bundle) — forcing a NodePort would mean rebuilding that image just for
+# K8s, breaking the property that the same images run under either
+# Compose or this chart unmodified. Set to LoadBalancer for a real cluster
+# with a working cloud/MetalLB controller, or set ingress.enabled instead.
+api:
+  service:
+    type: ClusterIP
+    port: 8080
+  corsAllowedOrigins: "http://localhost:3000"
+
+frontend:
+  service:
+    type: ClusterIP
+    port: 3000
+
+ingress:
+  enabled: false
+  className: nginx
+  host: indusense.local
+
+# Runs `migrate up` against a fresh Postgres before any app pod starts
+# (pre-install/pre-upgrade Helm hook) — see templates/jobs-migrate.yaml.
+migrate:
+  enabled: true
+
+# Seeds demo organizations/users/devices — post-install only (not
+# post-upgrade: scripts/seed is idempotent but re-running it on every
+# `helm upgrade` would be pointless work against an already-seeded DB).
+# Off by default since it's demo data, not something a real deployment
+# wants; the local Makefile/quickstart flow turns it on.
+seed:
+  enabled: false
+
+# Fires a bounded burst of real MQTT traffic from inside the cluster — see
+# templates/jobs-simulator.yaml for why this can't run from the host.
+simulator:
+  enabled: false
+  sensorCount: 50
+  messagesPerSecond: 50
+  anomalyRate: 0.1
+  durationSeconds: 30

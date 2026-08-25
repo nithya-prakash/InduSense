@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 2 of 18 (Domain) complete.** This README will be
+> **Status: Phase 3 of 18 (Sensor Simulation) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -121,10 +121,44 @@ make seed          # seed the factory hierarchy
 make unit-test     # go test ./...
 ```
 
-Not yet built: sensor simulator, ingestion service, stream processor,
-anomaly detection, alerting, incidents, auth/RBAC enforcement, REST/WS API,
-frontend, observability stack, Kubernetes manifests, CI/CD, and most testing.
-These land in Phases 3–18.
+## Current status (Phase 3 — Sensor Simulation)
+
+[simulator/](simulator/) is a standalone Go binary that loads the 1000 seeded
+sensors from Postgres and publishes realistic telemetry over real MQTT
+(Eclipse Mosquitto) — verified with a live broker, not mocked. Each of the
+1000 sensors runs as its own goroutine with a per-sensor baseline that drifts
+slowly within its operating range (bounded random walk with reversion toward
+the midpoint) plus gaussian noise; 200 machine-controller goroutines
+independently drive RUNNING/STOPPED transitions per device.
+
+Configurable fault injection (`ANOMALY_RATE`, `DUPLICATE_RATE`,
+`OUT_OF_ORDER_RATE`, `NETWORK_DELAY_RATE`, `SENSOR_FAILURE_RATE` — all in
+[.env.example](.env.example)) was verified to produce rates matching
+configuration (e.g. at 5% each: duplicates landed at ~5.0%, out-of-order at
+~5.2%, anomalies at ~4.7%, over a live 10-second run). A bounded channel
+(`SIM_QUEUE_CAPACITY`, default 20000) between sensor goroutines and a fixed
+pool of MQTT publisher workers provides backpressure — if publishing can't
+keep up, new samples are dropped (counted, not silently lost, and never
+causing unbounded memory growth) rather than queued indefinitely. Graceful
+shutdown on `SIGINT`/`SIGTERM` was verified to drain in-flight sensors and
+disconnect cleanly.
+
+Published topics:
+- `factory/{factory_id}/machine/{machine_id}/sensor/{sensor_id}/telemetry` — the telemetry event itself
+- `factory/{factory_id}/machine/{machine_id}/status` — RUNNING/STOPPED transitions
+- `factory/{factory_id}/machine/{machine_id}/events` — `SENSOR_FAILURE`, `SENSOR_RECOVERED`, `MACHINE_STOPPED`, `MACHINE_RUNNING`
+
+```bash
+make simulate          # run natively against localhost infra (Ctrl+C to stop gracefully)
+make simulate-docker   # run as a container on the compose network (profile: simulate)
+```
+
+Not yet built: ingestion service, stream processor, anomaly detection,
+alerting, incidents, auth/RBAC enforcement, REST/WS API, frontend,
+observability stack, Kubernetes manifests, CI/CD, and most formal testing
+(the tests so far are unit tests for the simulator's pure logic — the MQTT
+round trip above was verified manually, not yet a permanent automated test;
+that lands in Phase 13). These land in Phases 4–18.
 
 ## Local setup
 

@@ -142,6 +142,35 @@ services:
     logging: *default-logging
     networks: [indusense-net]
 
+  # ---------------------------------------------------------------------------
+  # Sensor simulator — on-demand only (not part of `docker compose up`).
+  # Run with `make simulate` or `docker compose --profile simulate up simulator`.
+  # ---------------------------------------------------------------------------
+  simulator:
+    build:
+      context: .
+      dockerfile: simulator/Dockerfile
+    container_name: indusense-simulator
+    profiles: ["simulate"]
+    environment:
+      SIM_POSTGRES_DSN: postgres://${POSTGRES_USER:-indusense}:${POSTGRES_PASSWORD:-indusense_dev_password}@postgres:5432/${POSTGRES_DB:-indusense}?sslmode=disable
+      SIM_MQTT_BROKER_URL: tcp://mosquitto:1883
+      MQTT_QOS: ${MQTT_QOS:-1}
+      SENSOR_COUNT: ${SENSOR_COUNT:-1000}
+      MESSAGES_PER_SECOND: ${MESSAGES_PER_SECOND:-1000}
+      ANOMALY_RATE: ${ANOMALY_RATE:-0.02}
+      DUPLICATE_RATE: ${DUPLICATE_RATE:-0.01}
+      OUT_OF_ORDER_RATE: ${OUT_OF_ORDER_RATE:-0.02}
+      NETWORK_DELAY_RATE: ${NETWORK_DELAY_RATE:-0.03}
+      SENSOR_FAILURE_RATE: ${SENSOR_FAILURE_RATE:-0.005}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [indusense-net]
+
 networks:
   indusense-net:
     driver: bridge

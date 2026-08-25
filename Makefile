@@ -84,9 +84,15 @@ e2e-test:
 seed:
 	SEED_POSTGRES_DSN="postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable" go run ./scripts/seed
 
-## simulate: run the sensor simulator against MQTT
+## simulate: run the sensor simulator against MQTT (Ctrl+C for graceful shutdown)
 simulate:
-	@echo "NOT YET IMPLEMENTED — added in Phase 3 (Sensor Simulation)"
+	SIM_POSTGRES_DSN="postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable" \
+	SIM_MQTT_BROKER_URL="tcp://localhost:1883" \
+	go run ./simulator
+
+## simulate-docker: run the simulator as a container against the compose network
+simulate-docker:
+	$(COMPOSE) --profile simulate up --build simulator
 
 ## load-test: run k6 load tests
 load-test:

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nithya-prakash/indusense/pkg/events"
 )
 
 type publishJob struct {
@@ -212,13 +213,13 @@ func runSensor(
 		if failed != wasFailed {
 			if failed {
 				st.sensorFailed.Add(1)
-				enqueue(eventsTopic, MachineEvent{
+				enqueue(eventsTopic, events.MachineEvent{
 					FactoryID: entry.FactoryID, MachineID: entry.MachineID,
 					DeviceID: entry.DeviceID, SensorID: entry.SensorID,
 					EventType: "SENSOR_FAILURE", Timestamp: time.Now().UTC(),
 				})
 			} else {
-				enqueue(eventsTopic, MachineEvent{
+				enqueue(eventsTopic, events.MachineEvent{
 					FactoryID: entry.FactoryID, MachineID: entry.MachineID,
 					DeviceID: entry.DeviceID, SensorID: entry.SensorID,
 					EventType: "SENSOR_RECOVERED", Timestamp: time.Now().UTC(),
@@ -235,18 +236,19 @@ func runSensor(
 			st.anomalies.Add(1)
 		}
 
-		evt := TelemetryEvent{
-			EventID:        uuid.NewString(),
-			OrganizationID: entry.OrganizationID,
-			FactoryID:      entry.FactoryID,
-			MachineID:      entry.MachineID,
-			DeviceID:       entry.DeviceID,
-			SensorID:       entry.SensorID,
-			Timestamp:      time.Now().UTC(),
-			SequenceNumber: seq,
-			Metric:         entry.Metric,
-			Value:          value,
-			Unit:           entry.Unit,
+		evt := events.TelemetryEvent{
+			EventID:          uuid.NewString(),
+			OrganizationID:   entry.OrganizationID,
+			FactoryID:        entry.FactoryID,
+			ProductionLineID: entry.ProductionLineID,
+			MachineID:        entry.MachineID,
+			DeviceID:         entry.DeviceID,
+			SensorID:         entry.SensorID,
+			Timestamp:        time.Now().UTC(),
+			SequenceNumber:   seq,
+			Metric:           entry.Metric,
+			Value:            value,
+			Unit:             entry.Unit,
 		}
 
 		fd := decideFaults(rng, cfg)
@@ -254,8 +256,8 @@ func runSensor(
 	}
 }
 
-func publishEvent(ctx context.Context, evt TelemetryEvent, topic string, fd faultDecision, enqueue func(string, any), st *stats) {
-	send := func(e TelemetryEvent) { enqueue(topic, e) }
+func publishEvent(ctx context.Context, evt events.TelemetryEvent, topic string, fd faultDecision, enqueue func(string, any), st *stats) {
+	send := func(e events.TelemetryEvent) { enqueue(topic, e) }
 
 	if fd.Delayed {
 		st.delayed.Add(1)
@@ -310,11 +312,11 @@ func runMachineController(
 				if !running {
 					newStatus = "RUNNING"
 				}
-				enqueue(statusTopic, MachineStatusEvent{
+				enqueue(statusTopic, events.MachineStatusEvent{
 					FactoryID: factoryID, MachineID: machineID,
 					Status: newStatus, Timestamp: time.Now().UTC(),
 				})
-				enqueue(eventsTopic, MachineEvent{
+				enqueue(eventsTopic, events.MachineEvent{
 					FactoryID: factoryID, MachineID: machineID, DeviceID: deviceID,
 					EventType: "MACHINE_" + newStatus, Timestamp: time.Now().UTC(),
 				})

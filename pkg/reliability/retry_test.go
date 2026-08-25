@@ -1,4 +1,4 @@
-package main
+package reliability
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 
 func TestRetryWithBackoffSucceedsWithoutRetrying(t *testing.T) {
 	calls := 0
-	err := retryWithBackoff(context.Background(), 5, time.Millisecond, func(time.Duration) {}, func() error {
+	err := RetryWithBackoff(context.Background(), 5, time.Millisecond, func(time.Duration) {}, func() error {
 		calls++
 		return nil
 	})
@@ -23,7 +23,7 @@ func TestRetryWithBackoffSucceedsWithoutRetrying(t *testing.T) {
 
 func TestRetryWithBackoffRetriesTransientFailures(t *testing.T) {
 	calls := 0
-	err := retryWithBackoff(context.Background(), 3, time.Millisecond, func(time.Duration) {}, func() error {
+	err := RetryWithBackoff(context.Background(), 3, time.Millisecond, func(time.Duration) {}, func() error {
 		calls++
 		if calls < 3 {
 			return errors.New("transient")
@@ -40,7 +40,7 @@ func TestRetryWithBackoffRetriesTransientFailures(t *testing.T) {
 
 func TestRetryWithBackoffGivesUpAfterMaxAttempts(t *testing.T) {
 	calls := 0
-	err := retryWithBackoff(context.Background(), 3, time.Millisecond, func(time.Duration) {}, func() error {
+	err := RetryWithBackoff(context.Background(), 3, time.Millisecond, func(time.Duration) {}, func() error {
 		calls++
 		return errors.New("always fails")
 	})
@@ -54,7 +54,7 @@ func TestRetryWithBackoffGivesUpAfterMaxAttempts(t *testing.T) {
 
 func TestRetryWithBackoffStopsImmediatelyOnPermanentError(t *testing.T) {
 	calls := 0
-	err := retryWithBackoff(context.Background(), 5, time.Millisecond, func(time.Duration) {}, func() error {
+	err := RetryWithBackoff(context.Background(), 5, time.Millisecond, func(time.Duration) {}, func() error {
 		calls++
 		return &ErrPermanent{Err: errors.New("schema invalid")}
 	})
@@ -68,7 +68,7 @@ func TestRetryWithBackoffStopsImmediatelyOnPermanentError(t *testing.T) {
 
 func TestRetryWithBackoffUsesDoublingDelay(t *testing.T) {
 	var delays []time.Duration
-	_ = retryWithBackoff(context.Background(), 4, time.Second, func(d time.Duration) {
+	_ = RetryWithBackoff(context.Background(), 4, time.Second, func(d time.Duration) {
 		delays = append(delays, d)
 	}, func() error {
 		return errors.New("fail")

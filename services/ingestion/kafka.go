@@ -7,6 +7,8 @@ import (
 	"log"
 	"time"
 
+	"github.com/nithya-prakash/indusense/pkg/events"
+	"github.com/nithya-prakash/indusense/pkg/reliability"
 	kafka "github.com/segmentio/kafka-go"
 )
 
@@ -19,7 +21,7 @@ type kafkaSink struct {
 	eventsWriter    *kafka.Writer
 	dlqWriter       *kafka.Writer
 
-	breaker    *CircuitBreaker
+	breaker    *reliability.CircuitBreaker
 	maxRetries int
 	retryDelay time.Duration
 }
@@ -40,7 +42,7 @@ func newKafkaSink(cfg Config) *kafkaSink {
 		telemetryWriter: newWriter(cfg.TopicTelemetryRaw),
 		eventsWriter:    newWriter(cfg.TopicDeviceEvents),
 		dlqWriter:       newWriter(cfg.TopicDeadLetter),
-		breaker:         NewCircuitBreaker(cfg.BreakerFailureThreshold, cfg.BreakerCooldown),
+		breaker:         reliability.NewCircuitBreaker(cfg.BreakerFailureThreshold, cfg.BreakerCooldown),
 		maxRetries:      cfg.KafkaMaxRetries,
 		retryDelay:      cfg.KafkaRetryBaseDelay,
 	}
@@ -57,10 +59,10 @@ func (k *kafkaSink) close() {
 // so a Kafka blip never silently drops data — the only case that's truly
 // unrecoverable is the dead-letter write also failing, in which case the
 // caller must not ack the source MQTT message so it gets redelivered later.
-func (k *kafkaSink) publishTelemetry(ctx context.Context, key string, evt NormalizedTelemetryEvent, rawPayload []byte, sourceTopic string) error {
+func (k *kafkaSink) publishTelemetry(ctx context.Context, key string, evt events.NormalizedTelemetryEvent, rawPayload []byte, sourceTopic string) error {
 	payload, err := json.Marshal(evt)
 	if err != nil {
-		return &ErrPermanent{Err: fmt.Errorf("marshal normalized telemetry: %w", err)}
+		return &reliability.ErrPermanent{Err: fmt.Errorf("marshal normalized telemetry: %w", err)}
 	}
 
 	err = k.writeWithProtection(ctx, k.telemetryWriter, key, payload)
@@ -70,13 +72,13 @@ func (k *kafkaSink) publishTelemetry(ctx context.Context, key string, evt Normal
 	}
 
 	log.Printf("ingestion: kafka publish to telemetry.raw failed after retries, routing to dead-letter: %v", err)
-	return k.deadLetter(ctx, rawPayload, err, errorTypeTransient, "kafka_publish", evt.CorrelationID, sourceTopic)
+	return k.deadLetter(ctx, rawPayload, err, events.ErrorTypeTransient, "kafka_publish", evt.CorrelationID, sourceTopic)
 }
 
-func (k *kafkaSink) publishMachineEvent(ctx context.Context, key string, evt NormalizedMachineEvent, rawPayload []byte, sourceTopic string) error {
+func (k *kafkaSink) publishMachineEvent(ctx context.Context, key string, evt events.NormalizedMachineEvent, rawPayload []byte, sourceTopic string) error {
 	payload, err := json.Marshal(evt)
 	if err != nil {
-		return &ErrPermanent{Err: fmt.Errorf("marshal normalized machine event: %w", err)}
+		return &reliability.ErrPermanent{Err: fmt.Errorf("marshal normalized machine event: %w", err)}
 	}
 
 	err = k.writeWithProtection(ctx, k.eventsWriter, key, payload)
@@ -86,15 +88,15 @@ func (k *kafkaSink) publishMachineEvent(ctx context.Context, key string, evt Nor
 	}
 
 	log.Printf("ingestion: kafka publish to device.events failed after retries, routing to dead-letter: %v", err)
-	return k.deadLetter(ctx, rawPayload, err, errorTypeTransient, "kafka_publish", evt.CorrelationID, sourceTopic)
+	return k.deadLetter(ctx, rawPayload, err, events.ErrorTypeTransient, "kafka_publish", evt.CorrelationID, sourceTopic)
 }
 
 func (k *kafkaSink) deadLetterValidationFailure(ctx context.Context, rawPayload []byte, validationErr error, correlationID, sourceTopic string) error {
-	return k.deadLetter(ctx, rawPayload, validationErr, errorTypeValidation, "validation", correlationID, sourceTopic)
+	return k.deadLetter(ctx, rawPayload, validationErr, events.ErrorTypeValidation, "validation", correlationID, sourceTopic)
 }
 
 func (k *kafkaSink) deadLetter(ctx context.Context, rawPayload []byte, cause error, errorType, stage, correlationID, sourceTopic string) error {
-	record := DeadLetterRecord{
+	record := events.DeadLetterRecord{
 		OriginalPayload: string(rawPayload),
 		Error:           cause.Error(),
 		ErrorType:       errorType,
@@ -131,7 +133,7 @@ func (k *kafkaSink) writeWithProtection(ctx context.Context, w *kafka.Writer, ke
 		return fmt.Errorf("circuit breaker open for kafka topic %s", w.Topic)
 	}
 
-	err := retryWithBackoff(ctx, k.maxRetries, k.retryDelay, func(d time.Duration) { time.Sleep(d) }, func() error {
+	err := reliability.RetryWithBackoff(ctx, k.maxRetries, k.retryDelay, func(d time.Duration) { time.Sleep(d) }, func() error {
 		return w.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload})
 	})
 

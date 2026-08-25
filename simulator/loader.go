@@ -18,7 +18,7 @@ func loadSensorCatalog(ctx context.Context, dsn string, limit int) ([]SensorCata
 	defer pool.Close()
 
 	rows, err := pool.Query(ctx, `
-		SELECT o.id, f.id, m.id, d.id, s.id, s.metric, s.unit,
+		SELECT o.id, f.id, pl.id, m.id, d.id, s.id, s.metric, s.unit,
 		       COALESCE(s.min_operating_value, 0), COALESCE(s.max_operating_value, 100)
 		FROM sensors s
 		JOIN devices d ON d.id = s.device_id
@@ -37,7 +37,7 @@ func loadSensorCatalog(ctx context.Context, dsn string, limit int) ([]SensorCata
 	var entries []SensorCatalogEntry
 	for rows.Next() {
 		var e SensorCatalogEntry
-		if err := rows.Scan(&e.OrganizationID, &e.FactoryID, &e.MachineID, &e.DeviceID,
+		if err := rows.Scan(&e.OrganizationID, &e.FactoryID, &e.ProductionLineID, &e.MachineID, &e.DeviceID,
 			&e.SensorID, &e.Metric, &e.Unit, &e.MinValue, &e.MaxValue); err != nil {
 			return nil, fmt.Errorf("scan sensor row: %w", err)
 		}

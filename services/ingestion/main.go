@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nithya-prakash/indusense/pkg/events"
 )
 
 func main() {
@@ -83,7 +84,7 @@ func processMessage(ctx context.Context, sink *kafkaSink, job inboundMessage) {
 }
 
 func handleTelemetry(ctx context.Context, sink *kafkaSink, job inboundMessage) {
-	var raw RawTelemetryEvent
+	var raw events.TelemetryEvent
 	if err := json.Unmarshal(job.payload, &raw); err != nil {
 		metricMessagesFailed.WithLabelValues("validation").Inc()
 		if dlqErr := sink.deadLetterValidationFailure(ctx, job.payload, err, uuid.NewString(), job.topic); dlqErr != nil {
@@ -104,11 +105,11 @@ func handleTelemetry(ctx context.Context, sink *kafkaSink, job inboundMessage) {
 		return
 	}
 
-	normalized := NormalizedTelemetryEvent{
-		RawTelemetryEvent: raw,
-		CorrelationID:     raw.EventID,
-		IngestedAt:        time.Now().UTC(),
-		SchemaVersion:     schemaVersion,
+	normalized := events.NormalizedTelemetryEvent{
+		TelemetryEvent: raw,
+		CorrelationID:  raw.EventID,
+		IngestedAt:     time.Now().UTC(),
+		SchemaVersion:  events.SchemaVersion,
 	}
 
 	if err := sink.publishTelemetry(ctx, raw.DeviceID, normalized, job.payload, job.topic); err != nil {
@@ -119,7 +120,7 @@ func handleTelemetry(ctx context.Context, sink *kafkaSink, job inboundMessage) {
 }
 
 func handleMachineEvent(ctx context.Context, sink *kafkaSink, job inboundMessage) {
-	var raw RawMachineEvent
+	var raw events.MachineEvent
 	if err := json.Unmarshal(job.payload, &raw); err != nil {
 		metricMessagesFailed.WithLabelValues("validation").Inc()
 		if dlqErr := sink.deadLetterValidationFailure(ctx, job.payload, err, uuid.NewString(), job.topic); dlqErr != nil {
@@ -141,11 +142,11 @@ func handleMachineEvent(ctx context.Context, sink *kafkaSink, job inboundMessage
 		return
 	}
 
-	normalized := NormalizedMachineEvent{
-		RawMachineEvent: raw,
-		CorrelationID:   correlationID,
-		IngestedAt:      time.Now().UTC(),
-		SchemaVersion:   schemaVersion,
+	normalized := events.NormalizedMachineEvent{
+		MachineEvent:  raw,
+		CorrelationID: correlationID,
+		IngestedAt:    time.Now().UTC(),
+		SchemaVersion: events.SchemaVersion,
 	}
 
 	if err := sink.publishMachineEvent(ctx, raw.DeviceID, normalized, job.payload, job.topic); err != nil {

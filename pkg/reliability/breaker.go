@@ -1,4 +1,8 @@
-package main
+// Package reliability holds retry-with-backoff and circuit-breaker
+// primitives shared by every service that calls an external dependency
+// (Kafka, InfluxDB, Postgres, a notification provider) where failures are
+// often correlated (a broker outage fails every in-flight call at once).
+package reliability
 
 import (
 	"sync"
@@ -13,17 +17,11 @@ const (
 	breakerHalfOpen
 )
 
-// CircuitBreaker protects a downstream dependency (Kafka, in this service)
-// from retry storms during an outage: once failures cross the threshold, it
-// opens and short-circuits calls immediately for a cooldown period, then
-// allows a single trial call through (half-open) to test recovery before
-// fully closing again.
-//
-// It is useful here because Kafka publish failures are correlated (a broker
-// outage fails every in-flight publish at once) — retrying each one
-// individually would just amplify load on an already-struggling broker. It
-// would NOT be useful for, say, a single validation failure, which is
-// independent per-message and never "recovers" on its own.
+// CircuitBreaker short-circuits calls to a struggling dependency instead of
+// retrying each one individually, which would just add load to an already
+// failing broker/database. It is NOT useful for independent, uncorrelated
+// failures (e.g. a single message failing validation) since there's nothing
+// to "trip" — the breaker earns its keep on dependency-wide outages only.
 type CircuitBreaker struct {
 	mu               sync.Mutex
 	state            breakerState
@@ -31,7 +29,6 @@ type CircuitBreaker struct {
 	threshold        int
 	cooldown         time.Duration
 	openedAt         time.Time
-	trialInFlight    bool
 	now              func() time.Time
 }
 
@@ -43,9 +40,8 @@ func NewCircuitBreaker(threshold int, cooldown time.Duration) *CircuitBreaker {
 	}
 }
 
-// Allow reports whether a call may proceed. When the breaker is open but the
-// cooldown has elapsed, it transitions to half-open and allows exactly one
-// trial call through.
+// Allow reports whether a call may proceed. When open but the cooldown has
+// elapsed, it transitions to half-open and allows exactly one trial call.
 func (b *CircuitBreaker) Allow() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -58,7 +54,6 @@ func (b *CircuitBreaker) Allow() bool {
 	case breakerOpen:
 		if b.now().Sub(b.openedAt) >= b.cooldown {
 			b.state = breakerHalfOpen
-			b.trialInFlight = true
 			return true
 		}
 		return false
@@ -70,7 +65,6 @@ func (b *CircuitBreaker) RecordSuccess() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.consecutiveFails = 0
-	b.trialInFlight = false
 	b.state = breakerClosed
 }
 
@@ -79,10 +73,8 @@ func (b *CircuitBreaker) RecordFailure() {
 	defer b.mu.Unlock()
 
 	if b.state == breakerHalfOpen {
-		// The trial call failed: back to open for another full cooldown.
 		b.state = breakerOpen
 		b.openedAt = b.now()
-		b.trialInFlight = false
 		return
 	}
 
@@ -105,4 +97,11 @@ func (b *CircuitBreaker) State() string {
 		return "HALF_OPEN"
 	}
 	return "UNKNOWN"
+}
+
+// SetNowFunc overrides the breaker's clock, for deterministic tests.
+func (b *CircuitBreaker) SetNowFunc(now func() time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.now = now
 }

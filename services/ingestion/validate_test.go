@@ -6,21 +6,23 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nithya-prakash/indusense/pkg/events"
 )
 
-func validTelemetry() RawTelemetryEvent {
-	return RawTelemetryEvent{
-		EventID:        uuid.NewString(),
-		OrganizationID: uuid.NewString(),
-		FactoryID:      uuid.NewString(),
-		MachineID:      uuid.NewString(),
-		DeviceID:       uuid.NewString(),
-		SensorID:       uuid.NewString(),
-		Timestamp:      time.Now().UTC().Format(time.RFC3339Nano),
-		SequenceNumber: 1,
-		Metric:         "temperature",
-		Value:          42.5,
-		Unit:           "celsius",
+func validTelemetry() events.TelemetryEvent {
+	return events.TelemetryEvent{
+		EventID:          uuid.NewString(),
+		OrganizationID:   uuid.NewString(),
+		FactoryID:        uuid.NewString(),
+		ProductionLineID: uuid.NewString(),
+		MachineID:        uuid.NewString(),
+		DeviceID:         uuid.NewString(),
+		SensorID:         uuid.NewString(),
+		Timestamp:        time.Now().UTC(),
+		SequenceNumber:   1,
+		Metric:           "temperature",
+		Value:            42.5,
+		Unit:             "celsius",
 	}
 }
 
@@ -46,11 +48,11 @@ func TestValidateTelemetryRejectsMissingUUID(t *testing.T) {
 	}
 }
 
-func TestValidateTelemetryRejectsBadTimestamp(t *testing.T) {
+func TestValidateTelemetryRejectsZeroTimestamp(t *testing.T) {
 	e := validTelemetry()
-	e.Timestamp = "not-a-timestamp"
+	e.Timestamp = time.Time{}
 	if err := validateTelemetry(e); err == nil {
-		t.Fatal("expected error for malformed timestamp")
+		t.Fatal("expected error for zero-value timestamp")
 	}
 }
 
@@ -87,10 +89,10 @@ func TestValidateTelemetryRejectsEmptyUnit(t *testing.T) {
 }
 
 func TestValidateMachineEventRequiresStatusOrEventType(t *testing.T) {
-	e := RawMachineEvent{
+	e := events.MachineEvent{
 		FactoryID: uuid.NewString(),
 		MachineID: uuid.NewString(),
-		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Timestamp: time.Now().UTC(),
 	}
 	if err := validateMachineEvent(e); err == nil {
 		t.Fatal("expected error when both status and event_type are empty")

@@ -1,4 +1,4 @@
-package main
+package reliability
 
 import (
 	"context"
@@ -6,18 +6,18 @@ import (
 	"time"
 )
 
-// ErrPermanent wraps an error that retrying cannot fix (e.g. a message too
-// large for the broker to ever accept). retryWithBackoff stops immediately
-// on this error instead of burning through its attempt budget.
+// ErrPermanent wraps an error that retrying cannot fix. RetryWithBackoff
+// stops immediately on this error instead of burning through its attempt
+// budget on something that will never succeed.
 type ErrPermanent struct{ Err error }
 
 func (e *ErrPermanent) Error() string { return e.Err.Error() }
 func (e *ErrPermanent) Unwrap() error { return e.Err }
 
-// retryWithBackoff calls fn up to maxAttempts times, doubling the delay
+// RetryWithBackoff calls fn up to maxAttempts times, doubling the delay
 // between attempts starting at baseDelay (1s, 2s, 4s, 8s, 16s, ...). It stops
 // early on ctx cancellation or a permanent error.
-func retryWithBackoff(ctx context.Context, maxAttempts int, baseDelay time.Duration, sleep func(time.Duration), fn func() error) error {
+func RetryWithBackoff(ctx context.Context, maxAttempts int, baseDelay time.Duration, sleep func(time.Duration), fn func() error) error {
 	var lastErr error
 	delay := baseDelay
 

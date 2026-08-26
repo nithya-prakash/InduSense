@@ -25,10 +25,23 @@ setup:
 	@test -f .env || cp .env.example .env
 	@echo "Environment file ready at .env"
 
-## up: start all infrastructure + application services
+INFRA_SERVICES := postgres redis mosquitto kafka kafka-init-topics kafka-ui influxdb prometheus grafana jaeger
+
+## up: start infra, apply migrations, then start the application services
+#
+# Two-phase on purpose, not one `docker compose up -d --build`: none of
+# the app services have a restart policy, and anomaly-detector/
+# alert-service both run an eager Postgres query at startup (not a lazy
+# connection). Against a genuinely fresh, empty database, both die on
+# their very first attempt, before migrate-up has had a chance to create
+# any tables — and because nothing restarts them, `docker compose up`
+# alone leaves them Exited forever, not crash-looping-then-recovering the
+# way Kubernetes would. Bringing up infra first, migrating, then bringing
+# up the rest means the app services' first-ever query finds real tables.
 up:
-	$(COMPOSE) up -d --build
-	@echo "Waiting for services to become healthy..."
+	$(COMPOSE) up -d --build --wait --wait-timeout 180 $(INFRA_SERVICES)
+	$(MAKE) migrate-up
+	$(COMPOSE) up -d --build --wait --wait-timeout 180
 	@$(COMPOSE) ps
 
 ## down: stop and remove all containers (volumes preserved)
@@ -81,8 +94,26 @@ e2e-test:
 	go test ./tests/e2e/... -race -count=1 -timeout=5m
 
 ## seed: seed organizations/factories/machines/devices/sensors into Postgres
+#
+# Restarts anomaly-detector and alert-service afterward: both load a
+# Postgres-derived cache once at startup (anomaly-detector's device/sensor
+# catalog, alert-service's rule cache) and only refresh it periodically —
+# every 300s and 60s by default. Against a freshly-seeded database, both
+# services started with an empty cache, so newly-seeded devices/rules
+# would otherwise be invisible to rule-based anomaly detection for up to
+# 5 minutes. A restart reloads the cache immediately instead of waiting.
+#
+# The brief sleep afterward is a pragmatic, honest tradeoff, not a real
+# guarantee: neither service's /ready endpoint checks Kafka consumer-group
+# state (it never needed to before this), so there's no signal to poll for
+# "the group has finished rebalancing" — this was discovered by a CI run
+# that restarted both services and then immediately published test
+# traffic, landing inside that rebalance window and timing out even
+# though the pipeline was working correctly, just not fully stood up yet.
 seed:
 	SEED_POSTGRES_DSN="postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable" go run ./scripts/seed
+	$(COMPOSE) restart anomaly-detector alert-service
+	sleep 5
 
 ## simulate: run the sensor simulator against MQTT (Ctrl+C for graceful shutdown)
 simulate:

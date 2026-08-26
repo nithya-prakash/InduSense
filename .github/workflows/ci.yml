@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-actions:
+    name: Lint workflow files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: reviewdog/action-actionlint@v1
+        with:
+          fail_level: error
+
+  lint-go:
+    name: Go fmt / vet / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$fmt_out"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go build
+        run: go build -o /dev/null ./...
+
+  lint-frontend:
+    name: Frontend lint / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  lint-helm:
+    name: Helm chart lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint infrastructure/helm/indusense
+
+  test:
+    name: Test suite (real infra via docker compose)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint-go]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Configure environment
+        run: make setup
+
+      - name: Start infra, migrate, start app services (make up)
+        run: make up
+
+      - name: Seed demo data
+        run: make seed
+
+      - name: Run the full Go test suite (unit, integration, contract, e2e)
+        run: go test ./... -race -count=1 -timeout=5m
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # Builds and pushes every service image to GHCR — the closest thing this
+  # portfolio project has to "CD": there's no live remote environment to
+  # deploy the Helm chart into, so publishing versioned, pullable images is
+  # the honest scope for continuous delivery here, not a fabricated deploy
+  # step against infrastructure that doesn't exist. `helm install` against
+  # a real cluster (Phase 14) already proves the chart can consume exactly
+  # these image names once someone points `images.*.repository` at ghcr.io.
+  publish-images:
+    name: Build and push images to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint-go, lint-frontend, lint-helm, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - image: ingestion
+            context: .
+            dockerfile: services/ingestion/Dockerfile
+          - image: stream-processor
+            context: .
+            dockerfile: services/stream-processor/Dockerfile
+          - image: anomaly-detector
+            context: .
+            dockerfile: services/anomaly-detector/Dockerfile
+          - image: alert-service
+            context: .
+            dockerfile: services/alert-service/Dockerfile
+          - image: api
+            context: .
+            dockerfile: services/api/Dockerfile
+          - image: migrate
+            context: .
+            dockerfile: infrastructure/docker/migrate/Dockerfile
+          - image: seed
+            context: .
+            dockerfile: scripts/seed/Dockerfile
+          - image: frontend
+            context: ./frontend
+            dockerfile: frontend/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/indusense-${{ matrix.image }}:latest
+            ghcr.io/${{ github.repository_owner }}/indusense-${{ matrix.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -301,7 +301,16 @@ func TestE2E_AnomalyTriggersAlert(t *testing.T) {
 		Items []alert `json:"items"`
 	}
 
-	deadline := time.Now().Add(20 * time.Second)
+	// 45s, not 20s: `make seed` restarts anomaly-detector/alert-service so
+	// their Postgres-derived caches are immediately fresh (see the seed
+	// target's comment in Makefile), but neither service's /ready endpoint
+	// checks Kafka consumer-group state, so there's no signal for "the
+	// group has finished rebalancing" after that restart. A CI run once
+	// hit this directly: it restarted both services, published test
+	// traffic almost immediately after, and timed out at 20s even though
+	// the pipeline was working correctly — the alert just landed a few
+	// seconds later than that budget allowed for.
+	deadline := time.Now().Add(45 * time.Second)
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequest(http.MethodGet, apiURL+"/api/v1/alerts?severity=CRITICAL", nil)
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -323,5 +332,5 @@ func TestE2E_AnomalyTriggersAlert(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Fatalf("no CRITICAL alert for device %s appeared via the API within 20s of publishing temperature=%.0f", fixture.DeviceID, anomalousValue)
+	t.Fatalf("no CRITICAL alert for device %s appeared via the API within 45s of publishing temperature=%.0f", fixture.DeviceID, anomalousValue)
 }

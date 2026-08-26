@@ -6,7 +6,7 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 15 of 18 (Load Testing) complete.** This README will be
+> **Status: Phase 16 of 18 (CI/CD) complete.** This README will be
 > expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
 > and reliability notes as they are written.
 
@@ -940,7 +940,91 @@ via k6 (the simulator already exercises that path — see Phases 3-6's
 verification — and k6 has no first-class MQTT support without an
 experimental extension, so duplicating that coverage here wasn't worth the
 added surface); and soak/endurance testing (these are all short bursts,
-not hours-long steady-state runs). CI/CD lands in the remaining phases.
+not hours-long steady-state runs). CI/CD lands in this phase.
+
+## Current status (Phase 16 — CI/CD)
+
+[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every push
+and pull request to `main`: parallel lint jobs (`gofmt`/`go vet`/`go build`,
+the frontend's `eslint`/`next build`, `helm lint` on the Phase 14 chart,
+and `actionlint` on the workflow file itself), then a `test` job that
+spins up the *entire* real stack via `make up` (Postgres, Redis, Kafka,
+Mosquitto, InfluxDB, all five Go services) and runs
+`go test ./... -race -count=1` against it — unit, integration, contract,
+and E2E tests all in the same invocation, exactly as they run locally,
+against real infra rather than a CI-specific mocked substitute. On a push
+to `main` only, once every lint/test job has passed, `publish-images`
+builds and pushes all eight Dockerfiles (five services, migrate, seed,
+frontend) to GHCR, tagged `latest` and the commit SHA — the honest scope
+for "CD" here, since there's no live remote environment for this portfolio
+project to actually deploy the Helm chart into. Phase 14 already proved
+that chart can consume exactly these image names, once someone points
+`images.*.repository` at `ghcr.io/<owner>/indusense-<service>`.
+
+**Verified as thoroughly as it can be without a GitHub remote**: at the
+time of this commit the repository hasn't been pushed anywhere yet, so
+there's no live Actions run to point to — stated plainly rather than
+implied away. What *was* verified for real: `actionlint` against the
+workflow file (catches malformed job graphs, invalid action references,
+bad expression syntax — far more than YAML-syntax checking), and,
+critically, the `test` job's exact command sequence
+(`make setup && make up && make seed && go test ./... -race -count=1
+-timeout=5m`) run locally end-to-end from a **completely fresh, empty
+Postgres** — twice — since that's the one condition a long-running local
+dev environment never naturally exercises, and it's exactly the condition
+every CI run starts from.
+
+**Running it for real surfaced two genuine bugs, neither hypothetical:**
+
+1. **`make up` alone couldn't actually stand up a fresh clone.**
+   `anomaly-detector` and `alert-service` both run an eager Postgres query
+   at startup (not a lazy connection), and neither has a restart policy in
+   docker-compose.yml. Against a truly empty database — no schema yet,
+   since migrations were a separate manual step nowhere enforced before
+   the app containers started — both crashed on their very first attempt
+   and, unlike Kubernetes' default crash-loop-and-retry, just stayed
+   `Exited` forever. `make up` now does infra first (`--wait`), then
+   `make migrate-up`, then the app services (`--wait` again) — a two-phase
+   bring-up that mirrors the real dependency graph Compose has no native
+   way to express (it has no equivalent of a Kubernetes Job gating
+   dependent Deployments). This was a **pre-existing gap in the documented
+   quickstart**, not something this phase introduced — the README's
+   original "Local setup" steps never mentioned running migrations at all.
+
+2. **A freshly-seeded database's new devices/rules were invisible to
+   alerting for minutes, not seconds.** `anomaly-detector` caches its
+   Postgres-derived device/sensor catalog and only refreshes it every
+   300s by default; `alert-service` caches alert rules and refreshes
+   every 60s. Both load once, synchronously, at startup — so a service
+   that started against an empty database (the normal case, since
+   seeding happens after `make up`) keeps an empty cache until its next
+   scheduled refresh, regardless of how much real data `make seed` adds
+   in the meantime. `make seed` now restarts both services afterward,
+   which reloads their caches immediately instead of waiting out the
+   interval. That fix immediately surfaced a *third*, more subtle timing
+   issue: neither service's `/ready` endpoint checks Kafka consumer-group
+   state (it never needed to before this), so a test that restarted both
+   services and published traffic moments later could land inside a
+   normal post-restart rebalance window and see nothing — not because the
+   pipeline was broken, but because 20 seconds wasn't a realistic budget
+   for "two Kafka consumers rejoin their groups after a restart."
+   `tests/e2e`'s anomaly-to-alert deadline moved from 20s to 45s, and
+   `make seed` adds a brief settle pause after the restart. Confirmed
+   fixed by running the full suite twice more from completely fresh
+   state — the second run's actual elapsed time (19.1s) landed *inside*
+   the old 20s deadline almost by chance, a good illustration of why the
+   old margin was fragile rather than just "a bit slow once."
+
+**Not implemented in this phase**: an actual live GitHub Actions run (no
+remote configured — the honest reason live verification stops where it
+does here); a CD step that deploys anywhere real (no cluster to deploy
+Phase 14's chart into outside this laptop); dependency/vulnerability
+scanning (Dependabot, `govulncheck`, Trivy image scanning) and CodeQL —
+genuinely worth adding, not included here for scope reasons; and caching
+Go module/build layers across CI runs beyond what `actions/setup-go`
+already does automatically, and BuildKit's GHA cache backend used only in
+the publish job. DLQ tooling and remaining documentation land in the last
+phases.
 
 ## Local setup
 
@@ -948,7 +1032,7 @@ not hours-long steady-state runs). CI/CD lands in the remaining phases.
 git clone <repo>
 cd indusense
 make setup   # copies .env.example -> .env
-make up      # starts Postgres, Redis, Mosquitto, Kafka (+topics), Kafka UI, InfluxDB
+make up      # infra -> migrate -> app services -> frontend, all health-checked
 make ps      # check container health
 make down    # stop everything (data volumes preserved)
 ```
@@ -1004,6 +1088,7 @@ indusense/
 ├── load-tests/        # k6 scripts
 ├── scripts/           # dev/ops scripts
 ├── docs/              # architecture, ADRs, reliability, performance docs
+├── .github/workflows/ # CI/CD (GitHub Actions)
 └── docker-compose.yml
 ```
 

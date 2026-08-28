@@ -6,9 +6,9 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end, through
 real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
-> **Status: Phase 16 of 18 (CI/CD) complete.** This README will be
-> expanded as each phase lands. See [docs/](docs/) for architecture, ADRs,
-> and reliability notes as they are written.
+> **Status: 16 of 18 planned areas complete, most recently CI/CD.** This
+> README will be expanded as each area lands. See [docs/](docs/) for
+> architecture, ADRs, and reliability notes as they are written.
 
 ## Why this project exists
 
@@ -66,10 +66,9 @@ demonstrate concurrency, high-throughput networking, and efficient,
 cloud-native deployment — goroutines and channels map directly onto the
 worker-pool / bounded-queue patterns needed for MQTT ingestion and Kafka
 consumption, and static binaries make container images small and startup
-fast. See `docs/ADR-004-why-go.md` (added once ADRs are written in a later
-phase).
+fast. See `docs/ADR-004-why-go.md` (added once ADRs are written later on).
 
-## Current status (Phase 1 — Foundation)
+## Foundation
 
 Infrastructure is defined in [docker-compose.yml](docker-compose.yml) and has
 been started and functionally verified (not just container-healthy):
@@ -88,16 +87,17 @@ Kafka topics created (see [infrastructure/docker/kafka-init-topics.sh](infrastru
 `alerts` (6), `incidents` (3), `device.events` (3), `audit.events` (3), `dead-letter` (3).
 
 Telemetry topics are partitioned by `device_id` (to be enforced by the
-ingestion service in Phase 4) so that events for a given device are strictly
-ordered, while different devices process in parallel across partitions.
+ingestion service, see Ingestion below) so that events for a given device
+are strictly ordered, while different devices process in parallel across
+partitions.
 
-## Current status (Phase 2 — Domain)
+## Domain
 
 19 PostgreSQL tables created via 8 [golang-migrate](https://github.com/golang-migrate/migrate)
 migrations in [migrations/](migrations/): the factory hierarchy
 (`organizations` → `factories` → `production_lines` → `machines` → `devices`
 → `sensors`), auth/RBAC scaffolding (`users`, `roles`, `permissions`,
-`role_permissions`, `user_roles` — populated in Phase 9), `device_credentials`,
+`role_permissions`, `user_roles` — populated in Authentication below), `device_credentials`,
 `alert_rules`/`alerts`, `incidents`/`incident_events`, `maintenance_records`,
 `audit_logs`, and `idempotency_keys`. 60 indexes/constraints total, including
 partial-unique indexes enforcing "one active credential per device" and "one
@@ -121,7 +121,7 @@ make seed          # seed the factory hierarchy
 make unit-test     # go test ./...
 ```
 
-## Current status (Phase 3 — Sensor Simulation)
+## Sensor Simulation
 
 [simulator/](simulator/) is a standalone Go binary that loads the 1000 seeded
 sensors from Postgres and publishes realistic telemetry over real MQTT
@@ -153,14 +153,14 @@ make simulate          # run natively against localhost infra (Ctrl+C to stop gr
 make simulate-docker   # run as a container on the compose network (profile: simulate)
 ```
 
-## Current status (Phase 4 — Ingestion)
+## Ingestion
 
 [services/ingestion](services/ingestion/) bridges MQTT and Kafka:
 `MQTT (manual ack) → validate → normalize → Kafka`, with a bounded worker
 pool (`INGESTION_WORKER_POOL_SIZE`, default 50) reading off a bounded queue
 (`INGESTION_QUEUE_CAPACITY`, default 10000) fed by the MQTT subscriber. It
 never touches Postgres or InfluxDB directly — that's the stream processor's
-job (Phase 5).
+job (see Streaming below).
 
 **How at-least-once delivery is actually implemented here**, not just
 claimed: the MQTT client uses `CleanSession(false)` (persistent session) and
@@ -181,8 +181,8 @@ reconnect** — no data loss across a real Kafka outage plus a real process
 restart. It arrived as **two duplicate copies** a fraction of a millisecond
 apart (visible in Kafka by `ingested_at`), which is exactly why the
 architecture is built around idempotent consumers rather than a promise that
-duplicates can't happen — deduplication by `event_id` is Phase 5's job, not
-ingestion's.
+duplicates can't happen — deduplication by `event_id` is the stream
+processor's job (see Streaming below), not ingestion's.
 
 Also verified live: malformed telemetry (invalid UUID) is validated at the
 boundary and routed to `dead-letter` with the original payload, an
@@ -202,12 +202,12 @@ curl localhost:8081/ready     # false if MQTT is disconnected or the Kafka break
 curl localhost:8081/metrics   # Prometheus: messages_received/processed/failed_total, dlq_messages_total, mqtt_connections, processing_latency_seconds
 ```
 
-## Current status (Phase 5 — Streaming)
+## Streaming
 
 [services/stream-processor](services/stream-processor/) consumes
 `telemetry.raw`, deduplicates by `event_id`, writes each reading to
 InfluxDB, maintains rolling windowed aggregates, and republishes to
-`telemetry.processed` for the anomaly detector (Phase 6):
+`telemetry.processed` for the anomaly detector (see Anomaly Detection below):
 
 ```text
 telemetry.raw → dedup (Redis SETNX) → InfluxDB raw point → windowed aggregation → InfluxDB agg point → telemetry.processed
@@ -216,8 +216,9 @@ telemetry.raw → dedup (Redis SETNX) → InfluxDB raw point → windowed aggreg
 **Deduplication** claims each `event_id` in Redis (`SETNX` + TTL) *before*
 processing; a duplicate is skipped without repeating the InfluxDB write or
 aggregate update, but its offset is still committed. This is the mechanism
-that would have caught the literal duplicate produced live in Phase 4 (the
-MQTT-redelivery duplicate from the Kafka-outage test) — verified again here
+that would have caught the literal duplicate produced live during
+Ingestion's own verification above (the MQTT-redelivery duplicate from the
+Kafka-outage test) — verified again here
 with a fresh run: `duplicate_events_total` incremented for real duplicates
 generated by the simulator's `DUPLICATE_RATE`.
 
@@ -303,7 +304,7 @@ curl localhost:8082/ready     # false if Redis is unreachable or the InfluxDB br
 curl localhost:8082/metrics   # messages_consumed/failed_total, duplicate_events_total, kafka_consumer_lag, windowed_aggregates_written_total
 ```
 
-## Current status (Phase 6 — Anomaly Detection)
+## Anomaly Detection
 
 [services/anomaly-detector](services/anomaly-detector/) consumes
 `telemetry.processed` and runs three independent detection levels on every
@@ -360,7 +361,7 @@ InfluxDB/Kafka writes (`kafkaIO.protectedWrite` in `kafka.go`) — see
 unprotected, matching the same reasoning as elsewhere: a Kafka outage means
 there's nothing left to do but leave the source message uncommitted.
 
-## Current status (Phase 7 — Alerting)
+## Alerting
 
 [services/alert-service](services/alert-service/) consumes
 `anomalies.detected` and `device.events`, matches events against
@@ -381,10 +382,11 @@ used only by the direct machine-shutdown handler.
 
 **Deduplication + cooldown** (`store.go`): a new alert is refused if one for
 the same `(rule, device, metric)` is still open (an `INSERT ... ON CONFLICT
-... WHERE status = 'OPEN' DO NOTHING` matching the partial unique index from
-Phase 2, so this holds even under concurrent processing, not just via an
-application-level check) — or if the last one for that key resolved more
-recently than the rule's `cooldown_seconds`, which is what stops a flapping
+... WHERE status = 'OPEN' DO NOTHING` matching the partial unique index
+from the Domain section's schema, so this holds even under concurrent
+processing, not just via an application-level check) — or if the last one
+for that key resolved more recently than the rule's `cooldown_seconds`,
+which is what stops a flapping
 condition from re-paging immediately after resolution. Verified live: of
 109 qualifying anomalies processed in one run, 65 became new alerts and 25
 were correctly suppressed as duplicates of an already-open alert, with zero
@@ -418,7 +420,7 @@ the alert engine.
 curl localhost:8084/metrics   # alerts_generated_total{severity}, alerts_suppressed_total{reason}, alerts_escalated_total, notifications_sent_total{provider}
 ```
 
-## Current status (Phase 8 — Incidents)
+## Incidents
 
 Incident lifecycle management lives in the shared
 [pkg/incidents](pkg/incidents/incidents.go) package — imported by both
@@ -428,16 +430,17 @@ Incident lifecycle management lives in the shared
 was no independent workflow to justify a new microservice yet (the spec's
 own service list doesn't name one either). The manual lifecycle actions
 (acknowledge, assign, resolve, close) are implemented and fully tested now
-so Phase 10's REST API can call them directly once there's a human operator
-to invoke them — this phase proves the state machine and persistence are
-correct ahead of the API surface that will expose them.
+so the APIs section's REST API can call them directly once there's a human
+operator to invoke them — this section proves the state machine and
+persistence are correct ahead of the API surface that will expose them.
 
 **"Don't create unlimited incidents from repeated alerts"** is enforced at
 the database level, not just in application code: `openOrAttach` reuses any
 incident already active for a machine (`INSERT ... ON CONFLICT (machine_id)
 WHERE status IN (...) DO NOTHING`, racing safely against the same partial
-unique index from Phase 2) and logs a fresh alert as an `ALERT_ATTACHED`
-audit event instead of opening a second incident. Verified live: 7 real
+unique index from the Domain section's schema) and logs a fresh alert as
+an `ALERT_ATTACHED` audit event instead of opening a second incident.
+Verified live: 7 real
 alerts from a fresh traffic burst produced exactly 6 incidents, with 1
 correctly attached rather than duplicated — confirmed directly in Postgres
 with zero machines ever holding more than one active incident.
@@ -454,12 +457,13 @@ That test caught two real foreign-key constraints the hard way (an
 `users` rows, not placeholder strings) — the schema's referential integrity
 doing exactly its job.
 
-## Current status (Phase 9 — Authentication)
+## Authentication
 
 [pkg/auth](pkg/auth/) implements password hashing, JWT issuance/validation,
 RBAC, and multi-tenancy guards as domain logic with no HTTP dependency —
-same pattern as Phases 7–8: build and live-verify the logic before the
-REST API (Phase 10) exists to expose it. [pkg/audit](pkg/audit/) is a small
+same pattern as the Alerting and Incidents sections above: build and
+live-verify the logic before the REST API (see APIs below) exists to
+expose it. [pkg/audit](pkg/audit/) is a small
 shared writer for the `audit_logs` table, used by `pkg/auth` today and
 available to any service later.
 
@@ -497,7 +501,7 @@ JWT tradeoff), mitigated by a short TTL (`JWT_ACCESS_TTL_MINUTES`, default
 free; refresh tokens are revocable because they're tracked in Redis by
 design.
 
-## Current status (Phase 10 — APIs)
+## APIs
 
 [services/api](services/api/) is the REST + WebSocket surface: `pkg/auth`
 and `pkg/incidents` wired into real HTTP middleware, not reimplemented.
@@ -558,7 +562,7 @@ curl localhost:8080/api/v1/factories -H "Authorization: Bearer <token>"
 curl localhost:8080/docs   # Swagger UI
 ```
 
-**Not implemented in this phase, honestly deferred rather than rushed**:
+**Not implemented here, honestly deferred rather than rushed**:
 `/ws/incidents` (incidents don't yet publish to their own Kafka topic —
 `pkg/incidents` has a `Publisher` interface ready for this, just not wired
 to a writer); device-count-aware pagination cursors (offset pagination
@@ -589,7 +593,7 @@ Reprocessing a dead-lettered message today means manually re-publishing its
 `original_payload` to the appropriate source topic by hand — there is no
 one-click retry.
 
-## Current status (Phase 11 — Dashboard)
+## Dashboard
 
 [frontend/](frontend/) is a Next.js 16 + TypeScript app (App Router,
 Turbopack, Tailwind CSS) covering every page the spec asks for: Overview,
@@ -613,15 +617,15 @@ just reading the code: as ADMIN, the Alerts page shows "Acknowledge"
 buttons and the Incidents detail page shows an Actions panel; as VIEWER
 (no `alerts:manage`/`incidents:manage`), those controls are simply absent
 while the underlying data remains fully visible — the same
-read-without-write split enforced server-side in Phase 10, now visible in
-the browser.
+read-without-write split enforced server-side in the APIs section, now
+visible in the browser.
 
 **The full incident lifecycle was exercised through the actual UI**, not
 just curled: clicking "Move to ACKNOWLEDGED" updated the status badge,
 removed the now-invalid action buttons (only `INVESTIGATING`/`RESOLVED`
 remained, matching the state machine), and appended a real audit-history
 entry with a live timestamp — all sourced from the same Postgres rows
-Phase 10's tests already verified.
+the APIs section's tests already verified.
 
 **`/ws/alerts` drives a live "● live" indicator and the Alerts table** —
 acknowledging an alert updates its badge immediately via the REST call's
@@ -644,8 +648,8 @@ it's the more correct pattern either way.
 
 While building the Factory drill-down page, the frontend surfaced a real
 API gap: there was no endpoint to list a production line's machines. Added
-`GET /api/v1/production-lines/{id}/machines` to `services/api` (Phase 10)
-rather than working around it in the UI — exactly the kind of thing you
+`GET /api/v1/production-lines/{id}/machines` to `services/api` (see APIs
+above) rather than working around it in the UI — exactly the kind of thing you
 only find by actually using what you built.
 
 ```bash
@@ -653,7 +657,7 @@ make up   # frontend included in the default stack
 # http://localhost:3000 — demo login: admin@musterfabrik-gmbh.de / ChangeMe123!
 ```
 
-**Not implemented in this phase**: user creation/role-assignment UI (no
+**Not implemented here**: user creation/role-assignment UI (no
 backend endpoint exists yet — the Administration page says so explicitly
 rather than faking one); a chart library beyond Recharts line charts (no
 gauge/heatmap views); offline/optimistic UI for flaky connections.
@@ -661,11 +665,11 @@ gauge/heatmap views); offline/optimistic UI for flaky connections.
 Not yet built: Grafana/Jaeger, Kubernetes manifests, CI/CD, and
 most formal testing (tests so far are unit tests for pure logic plus
 live-Postgres/Redis integration tests for incidents and auth, plus this
-phase's live browser verification — none of which is yet captured as a
-permanent automated test; that lands in Phase 13). These land in
-Phases 12–18.
+section's live browser verification — none of which is yet captured as a
+permanent automated test; that's covered in Testing below). These are
+covered in the sections below.
 
-## Current status (Phase 12 — Observability)
+## Observability
 
 Four pillars, all live-verified against real running services rather than
 asserted from reading the code:
@@ -707,7 +711,7 @@ alone rather than converted wholesale, since they carry no per-event fields
 worth structuring.
 
 **OpenTelemetry tracing** (`pkg/tracing`) exports to the Jaeger container
-added this phase, over OTLP/HTTP. Getting this right required one real fix:
+added in this section, over OTLP/HTTP. Getting this right required one real fix:
 `otlptracehttp.WithEndpointURL` takes the URL's path as-is and does *not*
 default it to `/v1/traces`, so passing `OTEL_EXPORTER_OTLP_ENDPOINT` (an
 OTel-standard base URL with no path) straight through 404'd against Jaeger's
@@ -734,22 +738,24 @@ ID also showed up verbatim in that request's structured log line
 (`anomaly-detector`'s "anomaly detected" record), confirming logs and traces
 share an ID a reader could actually pivot between.
 
-**Not implemented in this phase**: tracing on the frontend (no browser-side
+**Not implemented here**: tracing on the frontend (no browser-side
 OTel SDK); log shipping to any aggregator (Loki, ELK) — logs are stdout-only,
 collected by `docker compose logs`; Prometheus alerting rules (Alertmanager)
 — Grafana dashboards exist but no alert *rules* fire from Prometheus itself,
 only from `alert-service`'s own domain logic; and most `log.Printf` call
 sites outside the lifecycle events above remain unstructured, as noted.
-These, along with Kubernetes manifests and CI/CD, land in Phases 14–18.
+These, along with Kubernetes manifests and CI/CD, are covered in the
+sections below.
 
-## Current status (Phase 13 — Testing)
+## Testing
 
 [Makefile](Makefile)'s `unit-test`/`integration-test`/`contract-test`/`e2e-test`
-targets were scaffolded back in Phase 1 pointing at `tests/integration/`,
-`tests/contract/`, and `tests/e2e/` — this phase is what actually populates
-them, on top of the unit and live-infra tests already written incrementally
-in Phases 1–12 (`pkg/auth`, `pkg/incidents`, and per-service pure-logic
-tests). All four tiers, run together, are what `make test` now covers.
+targets were scaffolded back in the Foundation section pointing at
+`tests/integration/`, `tests/contract/`, and `tests/e2e/` — this section is
+what actually populates them, on top of the unit and live-infra tests
+already written incrementally in the sections above (`pkg/auth`,
+`pkg/incidents`, and per-service pure-logic tests). All four tiers, run
+together, are what `make test` now covers.
 
 **Contract tests** ([tests/contract/](tests/contract/)) lock the JSON wire
 format of every event type in `pkg/events` — `NormalizedTelemetryEvent`,
@@ -770,7 +776,7 @@ The centerpiece is `TestTenantIsolation_FactoriesScopedToOrganization`: it
 logs in as both seeded organizations' admins for real and asserts
 `zweite-firma-gmbh` never sees `musterfabrik-gmbh`'s factories (or vice
 versa) — proving the "every query scopes by the JWT's `organization_id`"
-claim from Phase 10 against live data, not by re-reading the query.
+claim from the APIs section against live data, not by re-reading the query.
 Alongside it: RBAC (`VIEWER` gets 403 on `POST /api/v1/devices` before the
 handler body even runs; `ADMIN` reaches business validation instead),
 login success/failure, unauthenticated/malformed-token rejection, and rate
@@ -804,7 +810,7 @@ between.
   anomaly-detector's rule check → alert-service's rule match → Postgres →
   API, the platform's actual reason for existing. Both passed in under a
   second end to end against the real stack — a genuine (if informal, not a
-  load test) latency data point for Phase 15.
+  load test) latency data point for the Load Testing section below.
 
 Getting the alert test to run reliably took a second, more interesting
 fix: `zweite-firma-gmbh` (seeded purely for the tenant-isolation test
@@ -818,7 +824,7 @@ title = 'High temperature')` — always a device this specific rule has never
 fired for yet, so there's no cooldown state to race against, and the query
 is naturally self-renewing across repeated runs.
 
-**Not implemented in this phase**: consumer-driven contract testing (Pact
+**Not implemented here**: consumer-driven contract testing (Pact
 or similar) — the contract tests here are schema-locking, not full
 consumer-driven contracts; frontend tests (no Jest/Playwright suite yet);
 `go tool cover` coverage numbers for `services/api`/`ingestion`/etc. remain
@@ -829,10 +835,9 @@ binary process, so real, meaningful HTTP-level test coverage of the API
 doesn't show up in that number at all. Worth stating plainly rather than
 letting a low percentage look like an untested service, or citing test
 counts as if they meant something they don't. Kubernetes manifests, CI/CD,
-and load testing (Makefile's `load-test` target already names itself
-Phase 15) land in the remaining phases.
+and load testing are covered in the sections below.
 
-## Current status (Phase 14 — Kubernetes + Helm)
+## Kubernetes + Helm
 
 [infrastructure/helm/indusense/](infrastructure/helm/indusense/) is a Helm
 chart that deploys the entire stack — every StatefulSet, Deployment, and
@@ -846,7 +851,7 @@ alone: Docker Desktop's Kubernetes (kind-based, 1 node), a completely fresh
 `helm install --set seed.enabled=true` converging to all 15 pods `Running`
 in **66 seconds wall-clock**, real demo data landing in Postgres (2 orgs, 6
 users, 200 devices, 1000 sensors — via the same `scripts/seed` binary,
-rebuilt as a container image for the first time this phase), a real login
+rebuilt as a container image for the first time here), a real login
 returning a genuine JWT through a `kubectl port-forward`'d API, and —
 firing the in-cluster simulator Job — the full pipeline processing real
 traffic: stream-processor consuming 1734 messages, anomaly-detector
@@ -855,9 +860,9 @@ detecting 131 anomalies and generating 26 real alerts (8 CRITICAL / 13 HIGH
 operating range [20.00, 90.00]; z-score 3.80 exceeds threshold 3.00..."),
 all visible through the actual API. Grafana came up with all 4 dashboards
 provisioned from the same JSON as Compose, Prometheus showed all 5 Go
-services `up`, and Jaeger recorded real traces from all 5 — proving Phase
-12's observability stack works identically under Kubernetes DNS names with
-zero code changes.
+services `up`, and Jaeger recorded real traces from all 5 — proving the
+Observability section's stack works identically under Kubernetes DNS names
+with zero code changes.
 
 **Three real bugs were found and fixed by actually deploying, not by
 reading the YAML:**
@@ -917,15 +922,15 @@ carry that argument and is mounted from a ConfigMap instead.
 
 **Demo data seeding**
 ([templates/jobs-seed.yaml](infrastructure/helm/indusense/templates/jobs-seed.yaml))
-reuses `scripts/seed` unmodified, containerized for the first time this
-phase. It's a `post-install,post-upgrade` hook, off by default
+reuses `scripts/seed` unmodified, containerized for the first time here.
+It's a `post-install,post-upgrade` hook, off by default
 (`seed.enabled=false`) — the first version was `post-install`-only, which
 seemed like the more disciplined choice (why reseed an already-seeded
 database on every upgrade?) until it became clear that also meant the
 documented way to seed *after* the fact — `helm upgrade --set
 seed.enabled=true` — silently did nothing, since post-install hooks never
-fire on upgrades. `scripts/seed` was already fully idempotent from Phase
-1, so the fix cost nothing: add `post-upgrade` too.
+fire on upgrades. `scripts/seed` was already fully idempotent from the
+Foundation section, so the fix cost nothing: add `post-upgrade` too.
 
 **Traffic generation runs inside the cluster**
 ([templates/jobs-simulator.yaml](infrastructure/helm/indusense/templates/jobs-simulator.yaml)),
@@ -937,7 +942,7 @@ bounded with `activeDeadlineSeconds` rather than a duration flag, since the
 simulator binary itself has none — it normally runs until SIGTERM, exactly
 like the Compose version.
 
-**Not implemented in this phase**: an ingress controller/Ingress resource
+**Not implemented here**: an ingress controller/Ingress resource
 (written and gated behind `ingress.enabled=false`, since Docker Desktop's
 Kubernetes has none installed by default — untested against a real one);
 Kafka/Postgres clustering or multi-replica stateful components (every
@@ -946,9 +951,9 @@ rather than pretending this chart does something it doesn't); Horizontal
 Pod Autoscaling; NetworkPolicies. `api` runs 2 replicas behind its Service
 as the one genuinely meaningful horizontal-scaling demonstration, since
 it's the only stateless service worth the point. These, along with CI/CD,
-land in the remaining phases.
+are covered in the remaining sections below.
 
-## Current status (Phase 15 — Load Testing)
+## Load Testing
 
 [load-tests/](load-tests/) has three k6 scripts, each testing a different
 resource shape rather than one script trying to cover everything. All
@@ -1004,7 +1009,7 @@ real concurrent load.
 
 **[websocket-scale.js](load-tests/websocket-scale.js)** tests the other
 resource shape entirely — long-lived connections, not request/response —
-against `/ws/alerts`, the real-time fan-out from Phase 10. Ramping to 200
+against `/ws/alerts`, the real-time fan-out from the APIs section. Ramping to 200
 concurrent connections, held open 20s: **100% connected, 100% clean
 close** across 250 completed connection lifecycles (400 attempted; the
 rest were mid-hold when the test's ramp-down began, an expected teardown
@@ -1013,30 +1018,31 @@ at the full 200 concurrent. This measures connection scale, not delivery —
 it doesn't assert every socket receives a specific alert, since that would
 mean coordinating the simulator in lockstep with a scale test that's
 really about "can 200 sockets stay open and healthy"; real message
-delivery over this same endpoint was already proven live in Phase 11's
-browser verification of the "● live" indicator.
+delivery over this same endpoint was already proven live in the Dashboard
+section's browser verification of the "● live" indicator.
 
 `make load-test` runs all three against whatever's currently running —
 add k6 to your PATH first (`brew install k6`, or the binary from
 [k6.io](https://k6.io); the version used here was v0.55.0, installed
 without brew since this environment had neither `sudo` nor Homebrew).
 
-**Not implemented in this phase**: a distributed load-generation setup
+**Not implemented here**: a distributed load-generation setup
 (k6 running on separate hardware from the stack, or k6 Cloud) — the
 single-machine caveat above is a direct, honest consequence of not having
 that; MQTT/Kafka pipeline throughput under sustained heavy load specifically
-via k6 (the simulator already exercises that path — see Phases 3-6's
-verification — and k6 has no first-class MQTT support without an
-experimental extension, so duplicating that coverage here wasn't worth the
-added surface); and soak/endurance testing (these are all short bursts,
-not hours-long steady-state runs). CI/CD lands in this phase.
+via k6 (the simulator already exercises that path — see the verification in
+the Sensor Simulation through Anomaly Detection sections above — and k6 has
+no first-class MQTT support without an experimental extension, so
+duplicating that coverage here wasn't worth the added surface); and
+soak/endurance testing (these are all short bursts, not hours-long
+steady-state runs). CI/CD is covered next.
 
-## Current status (Phase 16 — CI/CD)
+## CI/CD
 
 [.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every push
 and pull request to `main`: parallel lint jobs (`gofmt`/`go vet`/`go build`,
-the frontend's `eslint`/`next build`, `helm lint` on the Phase 14 chart,
-and `actionlint` on the workflow file itself), then a `test` job that
+the frontend's `eslint`/`next build`, `helm lint` on the Kubernetes + Helm
+chart, and `actionlint` on the workflow file itself), then a `test` job that
 spins up the *entire* real stack via `make up` (Postgres, Redis, Kafka,
 Mosquitto, InfluxDB, all five Go services) and runs
 `go test ./... -race -count=1` against it — unit, integration, contract,
@@ -1046,9 +1052,10 @@ to `main` only, once every lint/test job has passed, `publish-images`
 builds and pushes all eight Dockerfiles (five services, migrate, seed,
 frontend) to GHCR, tagged `latest` and the commit SHA — the honest scope
 for "CD" here, since there's no live remote environment for this portfolio
-project to actually deploy the Helm chart into. Phase 14 already proved
-that chart can consume exactly these image names, once someone points
-`images.*.repository` at `ghcr.io/<owner>/indusense-<service>`.
+project to actually deploy the Helm chart into. The Kubernetes + Helm
+section above already proved that chart can consume exactly these image
+names, once someone points `images.*.repository` at
+`ghcr.io/<owner>/indusense-<service>`.
 
 **Verified as thoroughly as it can be without a GitHub remote**: at the
 time of this commit the repository hasn't been pushed anywhere yet, so
@@ -1077,7 +1084,7 @@ every CI run starts from.
    bring-up that mirrors the real dependency graph Compose has no native
    way to express (it has no equivalent of a Kubernetes Job gating
    dependent Deployments). This was a **pre-existing gap in the documented
-   quickstart**, not something this phase introduced — the README's
+   quickstart**, not something this fix introduced — the README's
    original "Local setup" steps never mentioned running migrations at all.
 
 2. **A freshly-seeded database's new devices/rules were invisible to
@@ -1104,15 +1111,15 @@ every CI run starts from.
    the old 20s deadline almost by chance, a good illustration of why the
    old margin was fragile rather than just "a bit slow once."
 
-**Not implemented in this phase**: an actual live GitHub Actions run (no
+**Not implemented here**: an actual live GitHub Actions run (no
 remote configured — the honest reason live verification stops where it
-does here); a CD step that deploys anywhere real (no cluster to deploy
-Phase 14's chart into outside this laptop); Trivy image scanning and
-CodeQL — genuinely worth adding, not included here for scope reasons; and
-caching Go module/build layers across CI runs beyond what `actions/setup-go`
-already does automatically, and BuildKit's GHA cache backend used only in
-the publish job. DLQ tooling and remaining documentation land in the last
-phases.
+does here); a CD step that deploys anywhere real (no cluster to deploy the
+Kubernetes + Helm section's chart into outside this laptop); Trivy image
+scanning and CodeQL — genuinely worth adding, not included here for scope
+reasons; and caching Go module/build layers across CI runs beyond what
+`actions/setup-go` already does automatically, and BuildKit's GHA cache
+backend used only in the publish job. DLQ tooling and remaining
+documentation remain potential future work.
 
 ### Operational hygiene (post-audit fixes)
 
@@ -1193,8 +1200,8 @@ kubectl port-forward -n indusense svc/indusense-api 8080:8080 &
 kubectl port-forward -n indusense svc/indusense-frontend 3000:3000 &
 ```
 
-To generate traffic (has to run as a pod — see the Phase 14 section above
-for why):
+To generate traffic (has to run as a pod — see the Kubernetes + Helm section
+above for why):
 
 ```bash
 helm upgrade indusense infrastructure/helm/indusense -n indusense \
@@ -1227,9 +1234,10 @@ oversight. An earlier draft of this README pointed here to a `docs/ADR-005`
 that was planned but never actually written — that link has been removed
 rather than left pointing at a file that doesn't exist. The reasoning itself
 is not missing, just not in a separate ADR: it's the dedup/idempotency
-notes scattered through the Phase 5, 6, and 7 sections above (Redis
-SETNX-based dedup in stream-processor, the `idempotency_keys`-backed claim
-in anomaly-detector, and alert-service's dedupe-key + cooldown logic).
+notes scattered through the Streaming, Anomaly Detection, and Alerting
+sections above (Redis SETNX-based dedup in stream-processor, the
+`idempotency_keys`-backed claim in anomaly-detector, and alert-service's
+dedupe-key + cooldown logic).
 
 ## Postgres connection pooling
 

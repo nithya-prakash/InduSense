@@ -68,7 +68,10 @@ type NormalizedMachineEvent struct {
 }
 
 // DeadLetterRecord is the shared shape every service uses when routing a
-// message to the dead-letter topic (see docs on the DLQ admin API, Phase 17).
+// message to the dead-letter topic. There is no admin API for this topic —
+// it's write-only from every service's perspective; inspect it with Kafka
+// UI (http://localhost:8089) or kafka-console-consumer (see README.md,
+// "Dead-letter queue").
 type DeadLetterRecord struct {
 	OriginalPayload string    `json:"original_payload"`
 	Error           string    `json:"error"`

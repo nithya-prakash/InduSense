@@ -19,13 +19,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/nithya-prakash/indusense/pkg/events"
+	"github.com/redis/go-redis/v9"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
@@ -51,6 +51,69 @@ func postgresDSN() string {
 		return v
 	}
 	return "postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable"
+}
+
+func redisAddr() string {
+	host := "localhost"
+	if v := os.Getenv("REDIS_HOST"); v != "" {
+		host = v
+	}
+	port := "6379"
+	if v := os.Getenv("REDIS_PORT"); v != "" {
+		port = v
+	}
+	return host + ":" + port
+}
+
+// TestMain flushes this API's rate-limit buckets before any test in this
+// package runs — see the identical TestMain in tests/integration/api_test.go
+// for the full reasoning. This package logs in at least once per test
+// (login, publishTelemetry's caller) against the same real-IP "auth"
+// bucket that package shares, so both need the same flush to avoid
+// inheriting stale counters across consecutive `go test ./...` runs.
+// testRedisClient is a package-level client (set up in TestMain, closed
+// after m.Run()) so flushRateLimitBuckets can be called cheaply from every
+// login() call without reconnecting each time. Left nil if Redis isn't
+// reachable at startup, in which case flushRateLimitBuckets is a no-op and
+// individual tests' own live-stack checks (e.g. requireLiveStack) still
+// handle an unreachable environment gracefully.
+var testRedisClient *redis.Client
+
+func TestMain(m *testing.M) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	client := redis.NewClient(&redis.Options{Addr: redisAddr()})
+	if client.Ping(ctx).Err() == nil {
+		testRedisClient = client
+	} else {
+		client.Close()
+	}
+	cancel()
+
+	code := m.Run()
+	if testRedisClient != nil {
+		testRedisClient.Close()
+	}
+	os.Exit(code)
+}
+
+// flushRateLimitBuckets clears every rate-limit counter so the call that
+// follows always starts from a clean budget — see the identical helper and
+// its full reasoning in tests/integration/api_test.go. A single flush at
+// process start (the old TestMain here) isn't enough on its own: it
+// doesn't cover repetitions within one `-count=N` run, or interference
+// from tests/integration's own deliberate rate-limit exhaustion test
+// sharing the same real-IP bucket.
+func flushRateLimitBuckets(t *testing.T) {
+	t.Helper()
+	if testRedisClient == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	iter := testRedisClient.Scan(ctx, 0, "ratelimit:*", 0).Iterator()
+	for iter.Next(ctx) {
+		testRedisClient.Del(ctx, iter.Val())
+	}
 }
 
 // sensorFixture is one real, currently-seeded sensor and the full
@@ -96,16 +159,32 @@ func lookupSensorFixture(t *testing.T, pool *pgxpool.Pool, orgSlug, metric strin
 	return f
 }
 
-// lookupNeverAlertedSensorFixture picks a sensor whose device has never
-// produced an alert with the given rule title. alert-service dedupes and
-// cooldowns by (rule, device+metric), so reusing an already-alerted device
-// would make the anomaly test flaky depending on whatever traffic (the
-// simulator, other test runs) happened to touch it before. A device with
-// zero rows for this rule title always takes the "create" path — no
-// cooldown state to race against. It's naturally self-renewing across
-// repeated test runs: once a device is used, it has an alert on record and
-// the next run picks a different one.
-func lookupNeverAlertedSensorFixture(t *testing.T, pool *pgxpool.Pool, orgSlug, metric, ruleTitle string) sensorFixture {
+// lookupIsolatedSensorFixture picks a sensor whose device has never
+// produced *any* CRITICAL alert — not just one from the given rule title.
+//
+// This used to only exclude the specific rule title being tested
+// (`lookupNeverAlertedSensorFixture`), which was a real, observed source of
+// flakiness: the live simulator generates background telemetry and other
+// alert types independently of this test (e.g. "Unexpected machine
+// shutdown" from a simulated status change), so a device could already
+// carry an unrelated CRITICAL alert. TestE2E_AnomalyTriggersAlert polls
+// `/api/v1/alerts?severity=CRITICAL` and matches by device_id — with the
+// old, narrower exclusion, that unrelated alert would be the first (and
+// only) match found for the device, and the test failed on a title
+// mismatch that had nothing to do with the telemetry it had just
+// published. Excluding every existing CRITICAL alert for the device (any
+// title, any status — matching exactly what that query can return) means
+// the chosen device is provably clean before the test starts: any CRITICAL
+// alert that later appears for it can only be caused by this test's own
+// telemetry, not by pre-existing state.
+//
+// alert-service also dedupes/cooldowns by (rule, device+metric), so this
+// continues to double as protection against that: a device with zero
+// existing alerts of any kind always takes the alert-creation path, never
+// the cooldown-suppression path. Naturally self-renewing across repeated
+// runs, same as before: once a device is used it has an alert on record,
+// so the next run picks a different one.
+func lookupIsolatedSensorFixture(t *testing.T, pool *pgxpool.Pool, orgSlug, metric string) sensorFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -121,15 +200,15 @@ func lookupNeverAlertedSensorFixture(t *testing.T, pool *pgxpool.Pool, orgSlug, 
 		JOIN factories fac ON fac.id = pl.factory_id
 		JOIN organizations o ON o.id = fac.organization_id
 		WHERE o.slug = $1 AND s.metric = $2
-		  AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.device_id = d.id AND a.title = $3)
+		  AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.device_id = d.id AND a.severity = 'CRITICAL')
 		ORDER BY d.id
 		LIMIT 1
-	`, orgSlug, metric, ruleTitle).Scan(
+	`, orgSlug, metric).Scan(
 		&f.OrganizationID, &f.FactoryID, &f.ProductionLineID, &f.MachineID, &f.DeviceID, &f.SensorID,
 		&f.Metric, &f.Unit, &f.MinOperating, &f.MaxOperating,
 	)
 	if err != nil {
-		t.Fatalf("find a %q device never alerted by rule %q in organization %q: %v", metric, ruleTitle, orgSlug, err)
+		t.Fatalf("find a %q device with no existing CRITICAL alert in organization %q: %v", metric, orgSlug, err)
 	}
 	return f
 }
@@ -167,20 +246,20 @@ func requireLiveStack(t *testing.T) (apiURL string, pool *pgxpool.Pool, mqttClie
 	return apiURL, pool, mqttClient
 }
 
-var loginIPCounter atomic.Int64
-
-// login uses its own synthetic X-Forwarded-For per call (RFC 5737
-// TEST-NET-3) so this package's logins never share the auth endpoint's
-// per-IP rate-limit bucket with tests/integration or with each other —
-// both packages otherwise hit the API from the same real test-runner IP,
-// which made two suites (or two runs) within the same minute interfere.
+// login no longer sets a synthetic X-Forwarded-For to dodge the auth
+// endpoint's rate limit — that relied on the API trusting a
+// client-supplied header for its own rate-limit key, exactly the spoofing
+// vulnerability the pre-GitHub audit found and closed (see
+// services/api/middleware.go's clientIPResolver). The header is now
+// correctly ignored by default, so this package's 2 logins simply share
+// the real-IP "auth" bucket like any other client — comfortably within
+// the configured limit (default 30/min in this deployment, see
+// docker-compose.yml) alongside tests/integration's own handful of logins.
 func login(t *testing.T, apiURL, email string) string {
 	t.Helper()
+	flushRateLimitBuckets(t)
 	body, _ := json.Marshal(map[string]string{"email": email, "password": demoPassword})
-	req, _ := http.NewRequest(http.MethodPost, apiURL+"/api/v1/auth/login", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Forwarded-For", fmt.Sprintf("203.0.113.%d", loginIPCounter.Add(1)%250+1))
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.Post(apiURL+"/api/v1/auth/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("login as %s: %v", email, err)
 	}
@@ -271,31 +350,45 @@ func TestE2E_TelemetryRoundTrip(t *testing.T) {
 }
 
 // TestE2E_AnomalyTriggersAlert publishes a reading far outside the operating
-// range for a musterfabrik-gmbh device that has never triggered "High
-// temperature" before (picked dynamically — see
-// lookupNeverAlertedSensorFixture — so this test can't collide with alert
-// cooldown state left behind by the simulator or earlier test runs), and
-// polls for the CRITICAL alert that rule (GREATER_THAN 90) should produce.
-// This proves MQTT -> ingestion -> Kafka -> anomaly-detector's rule check
-// -> alert-service's rule match -> Postgres -> API, the platform's actual
-// reason for existing.
+// range for a musterfabrik-gmbh device that has never produced any CRITICAL
+// alert before (picked dynamically — see lookupIsolatedSensorFixture — so
+// this test can't collide with alert cooldown state, or an unrelated alert
+// type, left behind by the simulator or earlier test runs), and polls for
+// the CRITICAL "High temperature" alert (rule GREATER_THAN 90) that reading
+// should produce. This proves MQTT -> ingestion -> Kafka ->
+// anomaly-detector's rule check -> alert-service's rule match -> Postgres
+// -> API, the platform's actual reason for existing.
+//
+// The match requires all three of device_id, title, AND triggered_at being
+// after this test's own start time (with a small clock-skew allowance for
+// the test binary and the Docker containers not sharing a clock with
+// perfect precision) — not device_id alone. A device is excluded from
+// selection if it already has *any* CRITICAL alert (see
+// lookupIsolatedSensorFixture), so in normal operation nothing should ever
+// need the title/time checks to disambiguate — but they're real assertions
+// on the outcome this test claims to prove, not just a defensive fallback,
+// so an alert that happens to share the device_id without actually being
+// the one this test's telemetry produced still correctly fails to match.
 //
 // zweite-firma-gmbh isn't used here: it was seeded with only a factory and
 // a machine (for the tenant-isolation test in tests/integration) and has no
 // devices or sensors of its own.
 func TestE2E_AnomalyTriggersAlert(t *testing.T) {
 	apiURL, pool, mqttClient := requireLiveStack(t)
-	fixture := lookupNeverAlertedSensorFixture(t, pool, "musterfabrik-gmbh", "temperature", "High temperature")
+	fixture := lookupIsolatedSensorFixture(t, pool, "musterfabrik-gmbh", "temperature")
 
 	const anomalousValue = 150.0 // "High temperature" rule fires above 90
+	const clockSkewAllowance = 5 * time.Second
 
 	token := login(t, apiURL, "admin@musterfabrik-gmbh.de")
+	testStart := time.Now().Add(-clockSkewAllowance)
 	publishTelemetry(t, mqttClient, fixture, anomalousValue)
 
 	type alert struct {
-		Severity string `json:"severity"`
-		DeviceID string `json:"device_id"`
-		Title    string `json:"title"`
+		Severity    string    `json:"severity"`
+		DeviceID    string    `json:"device_id"`
+		Title       string    `json:"title"`
+		TriggeredAt time.Time `json:"triggered_at"`
 	}
 	type page struct {
 		Items []alert `json:"items"`
@@ -323,14 +416,61 @@ func TestE2E_AnomalyTriggersAlert(t *testing.T) {
 		resp.Body.Close()
 
 		for _, a := range p.Items {
-			if a.DeviceID == fixture.DeviceID {
-				if a.Title != "High temperature" {
-					t.Fatalf("expected the triggered alert to be from the \"High temperature\" rule, got %q", a.Title)
-				}
-				return // found it — anomaly-to-alert pipeline confirmed
+			if a.DeviceID != fixture.DeviceID || a.TriggeredAt.Before(testStart) {
+				continue // not this test's alert — a pre-existing or unrelated one, keep polling
 			}
+			if a.Title != "High temperature" {
+				// lookupIsolatedSensorFixture guarantees this device had no
+				// CRITICAL alert before testStart, so a *different*,
+				// post-testStart CRITICAL alert appearing for it means
+				// something concurrent (most plausibly the live simulator)
+				// produced it — not our own out-of-range reading. That's not
+				// this test's assertion to make: keep polling for the one
+				// this test's own telemetry should still produce.
+				continue
+			}
+			return // found it — anomaly-to-alert pipeline confirmed, and it's this test's own alert
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	t.Fatalf("no CRITICAL alert for device %s appeared via the API within 45s of publishing temperature=%.0f", fixture.DeviceID, anomalousValue)
+	t.Fatalf("no CRITICAL \"High temperature\" alert for device %s (triggered after this test started) appeared via the API within 45s of publishing temperature=%.0f", fixture.DeviceID, anomalousValue)
+}
+
+// TestLookupIsolatedSensorFixture_ExcludesDeviceWithAnyExistingCriticalAlert
+// is a regression test for the exact bug that made TestE2E_AnomalyTriggersAlert
+// flaky: the old fixture lookup only excluded devices with an existing
+// alert matching the specific rule title under test ("High temperature"),
+// so a device already carrying an unrelated CRITICAL alert (e.g., from a
+// simulated machine shutdown) could still be selected — and would then be
+// the first, wrong match the test's poll loop found. This inserts a
+// throwaway CRITICAL alert with a deliberately different title against a
+// real, currently-selectable device, then asserts the lookup never selects
+// that device again while the alert exists — proving the exclusion is
+// title-independent, not just re-testing the original narrower behavior.
+func TestLookupIsolatedSensorFixture_ExcludesDeviceWithAnyExistingCriticalAlert(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, postgresDSN())
+	if err != nil || pool.Ping(ctx) != nil {
+		t.Skipf("no live Postgres reachable, skipping: %v", err)
+	}
+	defer pool.Close()
+
+	fixture := lookupIsolatedSensorFixture(t, pool, "musterfabrik-gmbh", "temperature")
+
+	var alertID string
+	err = pool.QueryRow(ctx, `
+		INSERT INTO alerts (organization_id, machine_id, device_id, severity, status, title, description, dedupe_key)
+		VALUES ($1, $2, $3, 'CRITICAL', 'OPEN', 'Unexpected machine shutdown', 'regression test alert — unrelated to High temperature', $4)
+		RETURNING id
+	`, fixture.OrganizationID, fixture.MachineID, fixture.DeviceID, "regression-test-dedupe-"+uuid.NewString()).Scan(&alertID)
+	if err != nil {
+		t.Fatalf("insert throwaway CRITICAL alert with an unrelated title: %v", err)
+	}
+	defer pool.Exec(context.Background(), `DELETE FROM alerts WHERE id = $1`, alertID) //nolint:errcheck
+
+	again := lookupIsolatedSensorFixture(t, pool, "musterfabrik-gmbh", "temperature")
+	if again.DeviceID == fixture.DeviceID {
+		t.Fatalf("lookupIsolatedSensorFixture re-selected device %s after it was given an unrelated CRITICAL alert (\"Unexpected machine shutdown\") — the exclusion must cover any existing CRITICAL alert, not just one matching the rule title under test", fixture.DeviceID)
+	}
 }

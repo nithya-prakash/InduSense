@@ -30,8 +30,16 @@ type catalog struct {
 	pool         *pgxpool.Pool
 }
 
-func newCatalog(ctx context.Context, dsn string) (*catalog, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+// newCatalog opens this service's only Postgres connection pool, sized
+// explicitly via maxConns rather than pgxpool's own default (max(4, NumCPU)
+// — see ANOMALY_POSTGRES_MAX_CONNS in .env.example).
+func newCatalog(ctx context.Context, dsn string, maxConns int) (*catalog, error) {
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	poolCfg.MaxConns = int32(maxConns)
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
@@ -49,6 +57,10 @@ func newCatalog(ctx context.Context, dsn string) (*catalog, error) {
 
 func (c *catalog) close() {
 	c.pool.Close()
+}
+
+func (c *catalog) ping(ctx context.Context) error {
+	return c.pool.Ping(ctx)
 }
 
 func (c *catalog) refresh(ctx context.Context) error {

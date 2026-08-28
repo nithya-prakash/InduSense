@@ -45,11 +45,10 @@ func main() {
 	var mqttConnected atomic.Bool
 	jobs := make(chan inboundMessage, cfg.QueueCapacity)
 
-	client, err := connectMQTT(cfg, &mqttConnected, jobs)
+	client, err := connectMQTT(ctx, cfg, &mqttConnected, jobs)
 	if err != nil {
 		log.Fatalf("ingestion: failed to connect to MQTT broker: %v", err)
 	}
-	defer client.Disconnect(1000)
 
 	startHealthServer(cfg.HTTPPort, &mqttConnected, sink)
 	log.Printf("ingestion: health/metrics server listening on :%s", cfg.HTTPPort)
@@ -62,15 +61,55 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("ingestion: shutdown signal received, draining queue...")
-	close(jobs)
-	wg.Wait()
+
+	// Ordered shutdown, not deferred: a pre-GitHub audit found that
+	// deferring client.Disconnect meant it ran *after* close(jobs) and
+	// wg.Wait() (defers unwind in LIFO order only once main() returns,
+	// while those two ran inline, first) — so the MQTT client was still
+	// connected, and still able to dispatch a message handler that tried
+	// to send into an already-closed jobs channel, panicking.
+	//
+	// Fixing the ordering alone isn't enough: paho's own docs warn that
+	// Disconnect "may return before all activities (goroutines) have
+	// completed" — it spawns a new, untracked goroutine per inbound
+	// message (see mqtt.go) and never waits for them. An earlier version
+	// of this fix tried to track those goroutines with a sync.WaitGroup
+	// (Add at the top of the handler, Wait here); go test -race caught
+	// that this doesn't work — a WaitGroup requires all Add calls to be
+	// coordinated with Wait, and a handler goroutine paho schedules late
+	// can call Add concurrently with (or after) a Wait that already
+	// returned, which is a documented WaitGroup misuse and panics.
+	//
+	// The actual fix: never give the race anything to land in. jobs is
+	// deliberately never closed, so a straggling handler goroutine — no
+	// matter when paho gets around to running it — can only ever send
+	// into an open, eventually-abandoned channel, never panic on a closed
+	// one. Workers (see worker) stop via ctx cancellation, not by ranging
+	// jobs to exhaustion, so closing it was never actually necessary.
+	client.Disconnect(1000) // 1-2. stop accepting new messages; paho quiesces in-flight work for up to 1s
+	wg.Wait()               // 3-5. workers drain whatever's buffered then stop on ctx.Done(); jobs is left open, not closed
 	log.Println("ingestion: shutdown complete")
 }
 
 func worker(ctx context.Context, wg *sync.WaitGroup, sink *kafkaSink, jobs <-chan inboundMessage) {
 	defer wg.Done()
-	for job := range jobs {
-		processMessage(ctx, sink, job)
+	for {
+		select {
+		case job := <-jobs:
+			processMessage(ctx, sink, job)
+		case <-ctx.Done():
+			// Drain whatever's already buffered rather than abandoning it.
+			// jobs is intentionally never closed (see main's shutdown
+			// sequence), so this is the only place it gets emptied.
+			for {
+				select {
+				case job := <-jobs:
+					processMessage(ctx, sink, job)
+				default:
+					return
+				}
+			}
+		}
 	}
 }
 

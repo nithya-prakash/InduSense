@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -166,37 +167,53 @@ func requirePermission(permission string) func(http.Handler) http.Handler {
 	}
 }
 
-// rateLimiter is a Redis-backed fixed-window limiter: INCR a per-window
-// counter keyed by (client IP, route bucket), set its expiry only on the
-// first increment of the window, and reject once the limit is exceeded.
-// Fixed-window is simpler than a sliding-window/token-bucket and sufficient
-// here — the spec asks for rate limiting to exist and return 429s with
-// correct headers, not for a particular algorithm's burst-smoothing
-// properties.
+// rateLimitScript makes the increment-and-set-expiry atomic. A plain
+// `INCR` followed by a separate `EXPIRE` call (the previous implementation)
+// has a window between the two Redis round-trips where a crash or
+// cancelled context leaves the key permanently without a TTL — harmless in
+// practice since the key already encodes its own minute and would just
+// become inert clutter, but a Lua script closes the gap for free since
+// Redis already guarantees atomic script execution, no extra
+// infrastructure required.
+var rateLimitScript = redis.NewScript(`
+	local count = redis.call("INCR", KEYS[1])
+	if count == 1 then
+		redis.call("EXPIRE", KEYS[1], ARGV[1])
+	end
+	return count
+`)
+
+// rateLimiter is a Redis-backed fixed-window limiter: atomically increment
+// a per-window counter keyed by (client IP, route bucket), set its expiry
+// only on the first increment of the window, and reject once the limit is
+// exceeded. Fixed-window is simpler than a sliding-window/token-bucket and
+// sufficient here — the spec asks for rate limiting to exist and return
+// 429s with correct headers, not for a particular algorithm's
+// burst-smoothing properties.
 type rateLimiter struct {
-	redis *redis.Client
+	redis      *redis.Client
+	ipResolver *clientIPResolver
 }
 
-func newRateLimiter(redisClient *redis.Client) *rateLimiter {
-	return &rateLimiter{redis: redisClient}
+func newRateLimiter(redisClient *redis.Client, ipResolver *clientIPResolver) *rateLimiter {
+	return &rateLimiter{redis: redisClient, ipResolver: ipResolver}
 }
 
 func (rl *rateLimiter) middleware(bucket string, limit int) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
-			windowKey := fmt.Sprintf("ratelimit:%s:%s:%d", bucket, clientIP(r), time.Now().Unix()/60)
+			// atomic INCR+EXPIRE via a Lua script — see rateLimitScript for
+			// why a separate INCR-then-EXPIRE isn't safe.
+			windowKey := fmt.Sprintf("ratelimit:%s:%s:%d", bucket, rl.ipResolver.resolve(r), time.Now().Unix()/60)
 
-			count, err := rl.redis.Incr(ctx, windowKey).Result()
+			count, err := rateLimitScript.Run(ctx, rl.redis, []string{windowKey}, int(time.Minute.Seconds())).Int64()
 			if err != nil {
 				// Fail open: Redis being briefly unavailable shouldn't take
 				// the whole API down. Logged for visibility.
 				log.Printf("api: rate limiter redis error (failing open): %v", err)
 				next.ServeHTTP(w, r)
 				return
-			}
-			if count == 1 {
-				rl.redis.Expire(ctx, windowKey, time.Minute)
 			}
 
 			w.Header().Set("X-RateLimit-Limit", fmt.Sprintf("%d", limit))
@@ -219,19 +236,82 @@ func max0(n int) int {
 	return n
 }
 
-// clientIP returns just the IP, never the port — r.RemoteAddr carries a
+// clientIPResolver decides what "the client's IP" means for rate limiting
+// and auth audit logging. By default it's just the TCP peer address
+// (RemoteAddr) — X-Forwarded-For is never consulted, because it's just a
+// header any direct client can set to whatever it wants. When
+// trustProxyHeaders is enabled, X-Forwarded-For is trusted ONLY when the
+// actual TCP peer connecting to this process is itself in trustedProxies
+// (e.g. a known reverse proxy/load balancer address) — a client that
+// connects directly, bypassing that proxy, still can't spoof its way past
+// rate limiting by setting the header itself.
+type clientIPResolver struct {
+	trustProxyHeaders bool
+	trustedProxies    []*net.IPNet
+}
+
+// newClientIPResolver parses trustedCIDRs (bare IPs are treated as /32 or
+// /128) once at startup, so a malformed value fails fast at boot rather
+// than silently never matching at request time.
+func newClientIPResolver(trustProxyHeaders bool, trustedCIDRs []string) (*clientIPResolver, error) {
+	nets := make([]*net.IPNet, 0, len(trustedCIDRs))
+	for _, entry := range trustedCIDRs {
+		cidr := entry
+		if !strings.Contains(cidr, "/") {
+			if ip := net.ParseIP(entry); ip != nil && ip.To4() != nil {
+				cidr = entry + "/32"
+			} else {
+				cidr = entry + "/128"
+			}
+		}
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid entry %q in API_TRUSTED_PROXY_CIDRS: %w", entry, err)
+		}
+		nets = append(nets, ipNet)
+	}
+	return &clientIPResolver{trustProxyHeaders: trustProxyHeaders, trustedProxies: nets}, nil
+}
+
+// resolve returns just the IP, never the port — r.RemoteAddr carries a
 // fresh ephemeral port on every new TCP connection, so keying rate limits
 // on the raw RemoteAddr string would put every single request in its own
 // bucket and never actually limit anything.
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return fwd
+func (c *clientIPResolver) resolve(r *http.Request) string {
+	peer := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		peer = host
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+
+	if !c.trustProxyHeaders || !c.isTrustedProxy(peer) {
+		return peer
 	}
-	return host
+
+	fwd := r.Header.Get("X-Forwarded-For")
+	if fwd == "" {
+		return peer
+	}
+	// X-Forwarded-For is a comma-separated hop chain appended to by each
+	// proxy in the path; the left-most entry is the original client as
+	// seen by the first (trusted) proxy.
+	first := strings.TrimSpace(strings.Split(fwd, ",")[0])
+	if first == "" {
+		return peer
+	}
+	return first
+}
+
+func (c *clientIPResolver) isTrustedProxy(peer string) bool {
+	ip := net.ParseIP(peer)
+	if ip == nil {
+		return false
+	}
+	for _, ipNet := range c.trustedProxies {
+		if ipNet.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // chain applies middleware in the given order, outermost first.

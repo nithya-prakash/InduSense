@@ -59,7 +59,7 @@ func main() {
 		log.Fatalf("stream-processor: cannot reach redis at startup: %v", err)
 	}
 
-	startHealthServer(cfg.HTTPPort, dedup, influx)
+	startHealthServer(cfg.HTTPPort, dedup, influx, kio)
 	log.Printf("stream-processor: health/metrics server listening on :%s", cfg.HTTPPort)
 
 	maxWindow := cfg.Windows[len(cfg.Windows)-1]

@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -38,7 +39,7 @@ func main() {
 	}
 	defer shutdownTracing(context.Background())
 
-	pool, err := pgxpool.New(ctx, cfg.PostgresDSN)
+	pool, err := newPostgresPool(ctx, cfg.PostgresDSN, cfg.PostgresMaxConns)
 	if err != nil {
 		log.Fatalf("api: connect to postgres: %v", err)
 	}
@@ -49,7 +50,11 @@ func main() {
 
 	authSvc := auth.NewService(pool, redisClient, cfg.JWTAccessSecret, cfg.JWTRefreshSecret, cfg.JWTAccessTTL, cfg.JWTRefreshTTL)
 	incidentStore := incidents.NewStore(pool, nil)
-	limiter := newRateLimiter(redisClient)
+	ipResolver, err := newClientIPResolver(cfg.TrustProxyHeaders, cfg.TrustedProxyCIDRs)
+	if err != nil {
+		log.Fatalf("api: invalid API_TRUSTED_PROXY_CIDRS: %v", err)
+	}
+	limiter := newRateLimiter(redisClient, ipResolver)
 	queryAPI := newInfluxQueryAPI(cfg.InfluxURL, cfg.InfluxToken, cfg.InfluxOrg)
 
 	hub := newWSHub()
@@ -82,6 +87,19 @@ func main() {
 		log.Fatalf("api: server error: %v", err)
 	}
 	log.Println("api: shutdown complete")
+}
+
+// newPostgresPool opens the single connection pool this service uses for
+// Postgres, sized explicitly via maxConns rather than pgxpool's own default
+// (max(4, NumCPU) — see API_POSTGRES_MAX_CONNS in .env.example), so pool
+// size doesn't silently change with the host's core count.
+func newPostgresPool(ctx context.Context, dsn string, maxConns int) (*pgxpool.Pool, error) {
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	poolCfg.MaxConns = int32(maxConns)
+	return pgxpool.NewWithConfig(ctx, poolCfg)
 }
 
 // runDeviceGaugeRefresher periodically publishes device counts by status
@@ -151,9 +169,9 @@ func registerRoutes(
 	mux.Handle("GET /api/v1/openapi.json", http.HandlerFunc(handleOpenAPISpec()))
 	mux.Handle("GET /ws/alerts", http.HandlerFunc(handleWSAlerts(hub, cfg.JWTAccessSecret)))
 
-	mux.Handle("POST /api/v1/auth/login", chain(handleLogin(authSvc), authLimit))
-	mux.Handle("POST /api/v1/auth/refresh", chain(handleRefresh(authSvc), authLimit))
-	mux.Handle("POST /api/v1/auth/logout", chain(handleLogout(authSvc), authLimit))
+	mux.Handle("POST /api/v1/auth/login", chain(handleLogin(authSvc, limiter.ipResolver), authLimit))
+	mux.Handle("POST /api/v1/auth/refresh", chain(handleRefresh(authSvc, limiter.ipResolver), authLimit))
+	mux.Handle("POST /api/v1/auth/logout", chain(handleLogout(authSvc, limiter.ipResolver), authLimit))
 
 	// --- Authenticated ---
 	mux.Handle("GET /api/v1/auth/me", authed(handleMe(), ""))

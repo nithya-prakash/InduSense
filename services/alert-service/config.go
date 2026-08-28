@@ -16,6 +16,7 @@ type Config struct {
 	TopicDeadLetter   string
 
 	PostgresDSN      string
+	PostgresMaxConns int
 	RuleRefreshEvery time.Duration
 
 	EscalationCheckEvery   time.Duration
@@ -37,6 +38,7 @@ func loadConfig() Config {
 		TopicDeadLetter:   envStr("KAFKA_TOPIC_DEAD_LETTER", "dead-letter"),
 
 		PostgresDSN:      envStr("ALERT_POSTGRES_DSN", "postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable"),
+		PostgresMaxConns: envInt("ALERT_POSTGRES_MAX_CONNS", 10),
 		RuleRefreshEvery: time.Duration(envInt("ALERT_RULE_REFRESH_SECONDS", 60)) * time.Second,
 
 		EscalationCheckEvery:   time.Duration(envInt("ALERT_ESCALATION_CHECK_SECONDS", 60)) * time.Second,

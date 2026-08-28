@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"sync/atomic"
 
@@ -47,6 +48,13 @@ func startHealthServer(port string, mqttConnected *atomic.Bool, sink *kafkaSink)
 	mux.Handle("/metrics", promhttp.Handler())
 
 	go func() {
-		_ = http.ListenAndServe(":"+port, mux) //nolint:gosec // internal-only health/metrics endpoint
+		// ListenAndServe only returns once the listener stops; nothing in
+		// this service ever calls Shutdown/Close on it, so any return here
+		// is unexpected (most likely a bind failure, e.g. the port already
+		// in use) and worth surfacing loudly rather than leaving /live and
+		// /ready silently unreachable for the rest of the process's life.
+		if err := http.ListenAndServe(":"+port, mux); err != nil { //nolint:gosec // internal-only health/metrics endpoint
+			log.Printf("ingestion: health/metrics server on :%s stopped: %v", port, err)
+		}
 	}()
 }

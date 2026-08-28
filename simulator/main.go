@@ -46,7 +46,7 @@ func main() {
 
 	log.Printf("simulator: loading sensor catalog from postgres (limit=%d)", cfg.SensorCount)
 	loadCtx, loadCancel := context.WithTimeout(ctx, 30*time.Second)
-	catalog, err := loadSensorCatalog(loadCtx, cfg.PostgresDSN, cfg.SensorCount)
+	catalog, err := loadSensorCatalog(loadCtx, cfg.PostgresDSN, cfg.SensorCount, cfg.PostgresMaxConns)
 	loadCancel()
 	if err != nil {
 		log.Fatalf("simulator: failed to load sensor catalog: %v", err)

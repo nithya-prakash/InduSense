@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"sync/atomic"
 	"time"
@@ -19,7 +20,16 @@ type inboundMessage struct {
 	ack     func()
 }
 
-func connectMQTT(cfg Config, connected *atomic.Bool, jobs chan<- inboundMessage) (mqtt.Client, error) {
+// connectMQTT wires the message handler to guard against the shutdown race
+// a pre-GitHub audit found: paho invokes message handlers on their own,
+// untracked goroutines, so a message could still arrive and be dispatched
+// after main() has started shutting down. Rather than track those
+// goroutines (a sync.WaitGroup can't safely do that here — see main.go's
+// shutdown sequence comment for why), jobs is simply never closed, so a
+// send from any of them is always safe no matter when it happens. ctx is
+// threaded through so a handler already in its select when shutdown begins
+// still bails out promptly via ctx.Done() instead of blocking.
+func connectMQTT(ctx context.Context, cfg Config, connected *atomic.Bool, jobs chan<- inboundMessage) (mqtt.Client, error) {
 	opts := mqtt.NewClientOptions().
 		AddBroker(cfg.MQTTBrokerURL).
 		SetClientID(cfg.MQTTClientID).
@@ -35,7 +45,7 @@ func connectMQTT(cfg Config, connected *atomic.Bool, jobs chan<- inboundMessage)
 			connected.Store(true)
 			metricMQTTConnected.Set(1)
 			log.Printf("mqtt: connected to %s", cfg.MQTTBrokerURL)
-			subscribe(c, cfg, jobs)
+			subscribe(ctx, c, cfg, jobs)
 		}).
 		SetConnectionLostHandler(func(_ mqtt.Client, err error) {
 			connected.Store(false)
@@ -54,10 +64,14 @@ func connectMQTT(cfg Config, connected *atomic.Bool, jobs chan<- inboundMessage)
 	return client, nil
 }
 
-func subscribe(client mqtt.Client, cfg Config, jobs chan<- inboundMessage) {
+func subscribe(ctx context.Context, client mqtt.Client, cfg Config, jobs chan<- inboundMessage) {
 	handler := func(_ mqtt.Client, msg mqtt.Message) {
 		select {
 		case jobs <- inboundMessage{topic: msg.Topic(), payload: msg.Payload(), ack: msg.Ack}:
+		case <-ctx.Done():
+			// Shutting down: deliberately do not send to jobs and do not
+			// ack — the persistent MQTT session redelivers this message
+			// after reconnect, same as any other unacked message.
 		case <-time.After(5 * time.Second):
 			// Queue has been full for 5s straight: don't ack, so the broker
 			// redelivers later — this is the ingestion-side backpressure

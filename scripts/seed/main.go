@@ -119,7 +119,15 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	pool, err := pgxpool.New(ctx, dsn)
+	// A one-shot CLI tool doesn't need many connections; still explicit
+	// (not pgxpool's max(4, NumCPU) default) and still configurable, per
+	// the same convention as the long-running services.
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	poolCfg.MaxConns = int32(envInt("SEED_POSTGRES_MAX_CONNS", 4))
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}

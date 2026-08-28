@@ -34,7 +34,8 @@ spec:
             - name: KAFKA_TOPIC_DEAD_LETTER
               value: {{ .Values.kafkaTopics.deadLetter | quote }}
             - name: ALERT_POSTGRES_DSN
-              value: {{ include "indusense.postgresDSN" . | quote }}
+              valueFrom:
+                secretKeyRef: { name: {{ .Release.Name }}-secrets, key: POSTGRES_DSN }
             - name: ALERT_SERVICE_PORT
               value: "8084"
             - name: OTEL_EXPORTER_OTLP_ENDPOINT

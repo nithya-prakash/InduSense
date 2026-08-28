@@ -50,20 +50,17 @@ type ruleCache struct {
 	pool  *pgxpool.Pool
 }
 
-func newRuleCache(ctx context.Context, dsn string) (*ruleCache, error) {
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("connect to postgres: %w", err)
-	}
+// newRuleCache reuses the caller's pool rather than opening its own —
+// alert-service used to open a second, independently-sized pool here
+// purely to run this cache's periodic refresh query, doubling its Postgres
+// connection footprint for no reason (see the pool passed in from main.go).
+func newRuleCache(ctx context.Context, pool *pgxpool.Pool) (*ruleCache, error) {
 	rc := &ruleCache{byKey: make(map[string][]AlertRule), pool: pool}
 	if err := rc.refresh(ctx); err != nil {
-		pool.Close()
 		return nil, err
 	}
 	return rc, nil
 }
-
-func (rc *ruleCache) close() { rc.pool.Close() }
 
 func (rc *ruleCache) refresh(ctx context.Context) error {
 	rows, err := rc.pool.Query(ctx, `

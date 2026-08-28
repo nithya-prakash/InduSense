@@ -33,5 +33,6 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           env:
             - name: SEED_POSTGRES_DSN
-              value: {{ include "indusense.postgresDSN" . | quote }}
+              valueFrom:
+                secretKeyRef: { name: {{ .Release.Name }}-secrets, key: POSTGRES_DSN }
 {{- end }}

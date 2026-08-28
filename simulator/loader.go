@@ -10,8 +10,16 @@ import (
 // loadSensorCatalog reads every sensor along with the full organization ->
 // factory -> machine -> device path needed to build MQTT topics and
 // telemetry events.
-func loadSensorCatalog(ctx context.Context, dsn string, limit int) ([]SensorCatalogEntry, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+// maxConns is explicit rather than pgxpool's own default (max(4, NumCPU) —
+// see SIM_POSTGRES_MAX_CONNS) since this pool exists only for the one
+// startup query below, not for sustained load.
+func loadSensorCatalog(ctx context.Context, dsn string, limit, maxConns int) ([]SensorCatalogEntry, error) {
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	poolCfg.MaxConns = int32(maxConns)
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}

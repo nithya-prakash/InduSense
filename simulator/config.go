@@ -7,6 +7,7 @@ import (
 
 type Config struct {
 	PostgresDSN       string
+	PostgresMaxConns  int
 	MQTTBrokerURL     string
 	MQTTClientID      string
 	MQTTQoS           byte
@@ -24,6 +25,7 @@ type Config struct {
 func loadConfig() Config {
 	return Config{
 		PostgresDSN:       envStr("SIM_POSTGRES_DSN", "postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable"),
+		PostgresMaxConns:  envInt("SIM_POSTGRES_MAX_CONNS", 4),
 		MQTTBrokerURL:     envStr("SIM_MQTT_BROKER_URL", "tcp://localhost:1883"),
 		MQTTClientID:      envStr("SIM_MQTT_CLIENT_ID", "indusense-simulator"),
 		MQTTQoS:           byte(envInt("MQTT_QOS", 1)),

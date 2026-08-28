@@ -20,7 +20,7 @@ type tokenResponse struct {
 	TokenType    string `json:"token_type"`
 }
 
-func handleLogin(authSvc *auth.Service) http.HandlerFunc {
+func handleLogin(authSvc *auth.Service, ipResolver *clientIPResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req loginRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -32,7 +32,7 @@ func handleLogin(authSvc *auth.Service) http.HandlerFunc {
 			return
 		}
 
-		pair, err := authSvc.Login(r.Context(), req.Email, req.Password, clientIP(r))
+		pair, err := authSvc.Login(r.Context(), req.Email, req.Password, ipResolver.resolve(r))
 		if err != nil {
 			switch {
 			case errors.Is(err, auth.ErrInvalidCredentials), errors.Is(err, auth.ErrUserInactive):
@@ -56,7 +56,7 @@ type refreshRequest struct {
 	RefreshToken string `json:"refresh_token"`
 }
 
-func handleRefresh(authSvc *auth.Service) http.HandlerFunc {
+func handleRefresh(authSvc *auth.Service, ipResolver *clientIPResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req refreshRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RefreshToken == "" {
@@ -64,7 +64,7 @@ func handleRefresh(authSvc *auth.Service) http.HandlerFunc {
 			return
 		}
 
-		pair, err := authSvc.RefreshAccessToken(r.Context(), req.RefreshToken, clientIP(r))
+		pair, err := authSvc.RefreshAccessToken(r.Context(), req.RefreshToken, ipResolver.resolve(r))
 		if err != nil {
 			if errors.Is(err, auth.ErrTokenRevoked) {
 				writeError(w, r, http.StatusUnauthorized, "TOKEN_REVOKED", "refresh token is invalid, expired, or already used")
@@ -83,14 +83,14 @@ func handleRefresh(authSvc *auth.Service) http.HandlerFunc {
 	}
 }
 
-func handleLogout(authSvc *auth.Service) http.HandlerFunc {
+func handleLogout(authSvc *auth.Service, ipResolver *clientIPResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req refreshRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.RefreshToken == "" {
 			writeError(w, r, http.StatusBadRequest, "INVALID_BODY", "refresh_token is required")
 			return
 		}
-		if err := authSvc.Logout(r.Context(), req.RefreshToken, clientIP(r)); err != nil {
+		if err := authSvc.Logout(r.Context(), req.RefreshToken, ipResolver.resolve(r)); err != nil {
 			if errors.Is(err, auth.ErrTokenRevoked) {
 				// Already logged out / invalid token: logout is idempotent
 				// from the client's point of view.

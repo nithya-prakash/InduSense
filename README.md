@@ -188,10 +188,13 @@ Also verified live: malformed telemetry (invalid UUID) is validated at the
 boundary and routed to `dead-letter` with the original payload, an
 `error`/`error_type`/`processing_stage`, and a `correlation_id` — then
 acked, since the failure is durably captured. A circuit breaker
-(`CircuitBreaker` in [breaker.go](services/ingestion/breaker.go), states
+(`CircuitBreaker` in [pkg/reliability](pkg/reliability/breaker.go), states
 CLOSED/OPEN/HALF_OPEN, unit-tested including the half-open trial-success and
 trial-failure transitions) wraps every Kafka write so a sustained outage
-fails fast instead of retrying every message into a struggling broker.
+fails fast instead of retrying every message into a struggling broker —
+shared by every service that writes to Kafka or InfluxDB (see
+`kafkaIO`/`influxSink` in ingestion, stream-processor, and
+anomaly-detector).
 
 ```bash
 curl localhost:8081/live      # process liveness — never fails on a dependency
@@ -229,6 +232,18 @@ InfluxDB write every 10s. Verified live: with real telemetry flowing,
 `sensor_telemetry_agg` points appeared in InfluxDB with correct
 `moving_avg`/`min`/`max`/`count` values, tagged by window.
 
+**Ordered by event time, not arrival order.** The ring buffer is kept
+sorted by each reading's own `timestamp` field regardless of the order
+messages are actually consumed in — a pre-GitHub audit found `add()`
+simply appending on arrival, which corrupted both the trim logic (it only
+scans from the front, assuming ascending order) and rate-of-change's
+"first vs. last sample" reasoning whenever the simulator's
+`OUT_OF_ORDER_RATE` (network delay) or ordinary Kafka redelivery caused a
+reading to arrive later than one with an earlier timestamp. Insertion is
+O(distance from the correct position) rather than O(1) append, which is
+the right trade for a bounded ring buffer where out-of-order arrivals are
+the exception, not the norm.
+
 **Consumption is deliberately single-goroutine per instance** — `FetchMessage`
 and `CommitMessages` run sequentially so offset commits always advance in
 the order messages were actually processed (a pool of goroutines committing
@@ -253,6 +268,35 @@ routed to `dead-letter` (verified live: a deliberately malformed message on
 Aggregate writes are best-effort (logged, not dead-lettered) since they're
 recomputable observability data, not a primary business record — a
 scope decision documented in code rather than left implicit.
+
+Its Kafka publish to `telemetry.processed` gets the same retry+breaker
+protection (`kafkaIO.protectedWrite` in `kafka.go`) — a pre-GitHub audit
+found this path, and the equivalent one in anomaly-detector, publishing
+directly with no protection at all, inconsistent with every other external
+call in the codebase. `dead-letter` writes are deliberately left
+unprotected in both, matching ingestion's existing convention: if Kafka is
+down entirely, there's nothing more to do but leave the source message
+uncommitted for redelivery once it recovers, so retrying the dead-letter
+write too would just be wasted latency. `kafka_circuit_breaker` is
+reported by `/ready` alongside `influxdb_circuit_breaker`.
+
+**Telemetry retention: 30 days (720h) in the reference deployment.** The
+`telemetry` bucket's retention is set via `INFLUXDB_RETENTION` (default
+`720h`) at first-time InfluxDB setup — see `docker-compose.yml`. This only
+applies when the `influxdb-data` volume is created fresh; InfluxDB does not
+retroactively apply `DOCKER_INFLUXDB_INIT_RETENTION` to an already-existing
+bucket. To change retention on a running deployment, look up the bucket ID
+and update it directly (`influx bucket update` takes `--id`, not a bucket
+name):
+
+```bash
+docker exec indusense-influxdb influx bucket list --org indusense --token "$INFLUXDB_TOKEN"
+docker exec indusense-influxdb influx bucket update \
+  --id <telemetry-bucket-id> --token "$INFLUXDB_TOKEN" --retention 720h
+```
+
+Retention is InfluxDB-only and has no effect on PostgreSQL, which retains
+its own data (devices, users, incidents, audit log, etc.) indefinitely.
 
 ```bash
 curl localhost:8082/ready     # false if Redis is unreachable or the InfluxDB breaker is OPEN
@@ -295,6 +339,26 @@ anomalies_detected_total{method="ISOLATION_FOREST"}     1
 curl localhost:8083/forests    # which machine types currently have a trained forest
 curl localhost:8083/metrics    # anomalies_detected_total{method}, isolation_forests_trained_total
 ```
+
+**Idempotency**: publishing to `anomalies.detected` is guarded by an atomic
+claim on the source telemetry event's `event_id`, via the `idempotency_keys`
+table (`services/anomaly-detector/idempotency.go`, scope
+`anomaly_detection`) — the same `INSERT ... ON CONFLICT DO NOTHING RETURNING`
+pattern alert-service uses for alert dedup. Without it, Kafka redelivering a
+`telemetry.processed` message (e.g. after a crash between publishing an
+anomaly and committing its offset) would run detection again and publish a
+second, distinct `AnomalyID` for the same physical reading — and,
+downstream, a second alert/incident. A redelivered event is detected as
+already-claimed and its (still-true) detection result is simply not
+re-published; the offset is still committed, since re-processing would
+reach the same outcome every time.
+
+Publishing to `anomalies.detected` is itself wrapped in the same
+retry-with-backoff-plus-circuit-breaker pattern as stream-processor's
+InfluxDB/Kafka writes (`kafkaIO.protectedWrite` in `kafka.go`) — see
+`/ready`'s `kafka_circuit_breaker` field. `dead-letter` writes are left
+unprotected, matching the same reasoning as elsewhere: a Kafka outage means
+there's nothing left to do but leave the source message uncommitted.
 
 ## Current status (Phase 7 — Alerting)
 
@@ -356,9 +420,11 @@ curl localhost:8084/metrics   # alerts_generated_total{severity}, alerts_suppres
 
 ## Current status (Phase 8 — Incidents)
 
-Incident lifecycle management lives inside `alert-service`
-([incidents.go](services/alert-service/incidents.go)) rather than as a
-separate "incident-service" — incidents originate 1:1 from alerts and there
+Incident lifecycle management lives in the shared
+[pkg/incidents](pkg/incidents/incidents.go) package — imported by both
+`alert-service` (which opens/attaches incidents from alerts) and `api`
+(which exposes the manual lifecycle actions) — rather than as a separate
+"incident-service" — incidents originate 1:1 from alerts and there
 was no independent workflow to justify a new microservice yet (the spec's
 own service list doesn't name one either). The manual lifecycle actions
 (acknowledge, assign, resolve, close) are implemented and fully tested now
@@ -380,7 +446,7 @@ with zero machines ever holding more than one active incident.
 with `RESOLVED → INVESTIGATING` allowed for a recurrence but `CLOSED`
 terminal) is unit-tested for every valid and invalid transition, then
 exercised end-to-end against a real Postgres instance in
-[incidents_live_test.go](services/alert-service/incidents_live_test.go) —
+[incidents_live_test.go](pkg/incidents/incidents_live_test.go) —
 open, attach, acknowledge, assign, investigate, resolve, reopen, re-resolve,
 close, and verifying a post-closure alert opens a genuinely new incident.
 That test caught two real foreign-key constraints the hard way (an
@@ -493,12 +559,35 @@ curl localhost:8080/docs   # Swagger UI
 ```
 
 **Not implemented in this phase, honestly deferred rather than rushed**:
-admin endpoints for browsing/retrying dead-letter queue messages (the DLQ
-mechanism itself works — every service already writes to it — only the
-admin API surface for browsing it doesn't exist yet); `/ws/incidents`
-(incidents don't yet publish to their own Kafka topic — `pkg/incidents`
-has a `Publisher` interface ready for this, just not wired to a writer);
-device-count-aware pagination cursors (offset pagination only).
+`/ws/incidents` (incidents don't yet publish to their own Kafka topic —
+`pkg/incidents` has a `Publisher` interface ready for this, just not wired
+to a writer); device-count-aware pagination cursors (offset pagination
+only).
+
+### Dead-letter queue
+
+Every service that consumes from Kafka (ingestion, stream-processor,
+anomaly-detector, alert-service) writes malformed or unrecoverably-failed
+messages to the shared `dead-letter` topic — see `pkg/events.DeadLetterRecord`
+for the shape every service uses. **This is write-only: there is no admin
+API, browsing UI, retry mechanism, or automated reprocessing built into
+InduSense itself.** An earlier draft of this README referenced a "DLQ admin
+API" that was never built and doesn't exist — that reference has been
+removed. To actually inspect what's in `dead-letter`, use standard Kafka
+tooling, both already available in this stack:
+
+```bash
+# Kafka UI — browse messages, headers, and offsets in a browser
+open http://localhost:8089    # Topics -> dead-letter -> Messages
+
+# Or from the command line, against the running kafka container:
+docker exec -it indusense-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic dead-letter --from-beginning
+```
+
+Reprocessing a dead-lettered message today means manually re-publishing its
+`original_payload` to the appropriate source topic by hand — there is no
+one-click retry.
 
 ## Current status (Phase 11 — Dashboard)
 
@@ -1018,13 +1107,50 @@ every CI run starts from.
 **Not implemented in this phase**: an actual live GitHub Actions run (no
 remote configured — the honest reason live verification stops where it
 does here); a CD step that deploys anywhere real (no cluster to deploy
-Phase 14's chart into outside this laptop); dependency/vulnerability
-scanning (Dependabot, `govulncheck`, Trivy image scanning) and CodeQL —
-genuinely worth adding, not included here for scope reasons; and caching
-Go module/build layers across CI runs beyond what `actions/setup-go`
+Phase 14's chart into outside this laptop); Trivy image scanning and
+CodeQL — genuinely worth adding, not included here for scope reasons; and
+caching Go module/build layers across CI runs beyond what `actions/setup-go`
 already does automatically, and BuildKit's GHA cache backend used only in
 the publish job. DLQ tooling and remaining documentation land in the last
 phases.
+
+### Operational hygiene (post-audit fixes)
+
+A pre-GitHub audit found several small but real operational gaps, all
+fixed and verified against the live stack:
+
+- **`kafka-ui` pinned** to `v0.7.2` (was `:latest`) — confirmed the pinned
+  tag resolves to the exact same image digest already running.
+- **Docker Compose resource limits**: every service now has a `mem_limit`
+  (docker-compose.yml previously had none at all, unlike the Helm chart's
+  per-service `requests`/`limits`, which already existed). Sized as
+  generous safety nets — well above real observed usage (Kafka's steady
+  ~680MB vs. its 2GiB cap) — rather than copying the Helm chart's tighter
+  Kubernetes-sized limits, since those are close enough to real usage that
+  applying them here risked OOM-killing containers on a busy host or a
+  resource-constrained CI runner. Verified live: full stack up, full test
+  suite green, with limits confirmed applied via `docker inspect`.
+- **Grafana credentials**: `GF_SECURITY_ADMIN_USER`/`GF_SECURITY_ADMIN_PASSWORD`
+  were hardcoded directly in docker-compose.yml — every other credential in
+  that file already used the `${VAR:-default}` pattern. Now
+  `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD`, documented in
+  `.env.example`.
+- **`infrastructure/kubernetes/`** — an empty, untracked, never-referenced
+  directory (no git history, not linked from anywhere) — removed.
+- **`govulncheck` added to CI** (a new, independent `govulncheck` job).
+  Running it locally against the pre-audit toolchain found 32 Go standard
+  library CVEs actually reachable from this code, every one already fixed
+  in a later 1.25.x patch — none were bugs in this codebase's own code or
+  in a third-party dependency. `go.mod`'s `go` directive moved from
+  `1.25.0` to `1.25.14` (the latest 1.25.x patch as of this fix — a
+  same-minor-version bump, not a jump to 1.26, to keep this change as small
+  as the fix it's addressing); rebuilding with it brings reachable
+  vulnerabilities to zero. Verified: full test suite (including `-race`)
+  green on the new toolchain, and all five Go service Docker images
+  rebuilt and confirmed healthy against the live stack.
+- **Dependabot** ([.github/dependabot.yml](.github/dependabot.yml)) added
+  for `gomod`, the frontend's `npm`, every Dockerfile's base image, and
+  the workflow file's own GitHub Actions — weekly, grouped per ecosystem.
 
 ## Local setup
 
@@ -1087,7 +1213,7 @@ indusense/
 ├── tests/             # integration, contract, e2e
 ├── load-tests/        # k6 scripts
 ├── scripts/           # dev/ops scripts
-├── docs/              # architecture, ADRs, reliability, performance docs
+├── docs/              # ANOMALY-DETECTION.md (design + evaluation writeup)
 ├── .github/workflows/ # CI/CD (GitHub Actions)
 └── docker-compose.yml
 ```
@@ -1097,4 +1223,32 @@ indusense/
 This system is designed around **at-least-once delivery + idempotent
 consumers + deduplication** — not exactly-once semantics across the whole
 distributed pipeline. This is a deliberate, documented tradeoff, not an
-oversight; see `docs/ADR-005` (added in a later phase) for the reasoning.
+oversight. An earlier draft of this README pointed here to a `docs/ADR-005`
+that was planned but never actually written — that link has been removed
+rather than left pointing at a file that doesn't exist. The reasoning itself
+is not missing, just not in a separate ADR: it's the dedup/idempotency
+notes scattered through the Phase 5, 6, and 7 sections above (Redis
+SETNX-based dedup in stream-processor, the `idempotency_keys`-backed claim
+in anomaly-detector, and alert-service's dedupe-key + cooldown logic).
+
+## Postgres connection pooling
+
+Every service that talks to Postgres sizes its own `pgxpool.Pool` explicitly
+via a `*_POSTGRES_MAX_CONNS` env var, rather than relying on pgxpool's own
+default of `max(4, NumCPU)` — left unset, pool size would silently vary with
+the host machine instead of being a deliberate choice. Reference-deployment
+defaults, chosen for steady-state load (well under PostgreSQL's own default
+`max_connections=100`, leaving headroom for `psql`/admin sessions and
+one-shot jobs run alongside the long-running services):
+
+| Service           | Env var                    | Default | Why |
+|--------------------|----------------------------|---------|-----|
+| api                | `API_POSTGRES_MAX_CONNS`     | 10 | Serves concurrent HTTP requests |
+| alert-service       | `ALERT_POSTGRES_MAX_CONNS`   | 10 | One shared pool for the alert store, incident store, and rule cache — alert-service used to open a second, independent pool just for the rule cache; that duplication is gone, see `newRuleCache` in `services/alert-service/rules.go` |
+| anomaly-detector    | `ANOMALY_POSTGRES_MAX_CONNS` | 5  | Only used for its periodically-refreshed device/sensor catalog, not per-event |
+| `make seed` / `scripts/seed` | `SEED_POSTGRES_MAX_CONNS` | 4 | One-shot job |
+| simulator (`loadSensorCatalog`) | `SIM_POSTGRES_MAX_CONNS` | 4 | Pool exists only for one startup query, then closes |
+
+ingestion and stream-processor don't appear here — neither talks to
+Postgres directly (ingestion only bridges MQTT to Kafka; stream-processor
+writes to InfluxDB, not Postgres).

@@ -15,7 +15,13 @@ type Config struct {
 	TopicDeadLetter string
 
 	PostgresDSN         string
+	PostgresMaxConns    int
 	CatalogRefreshEvery time.Duration
+
+	KafkaMaxRetries         int
+	KafkaRetryBaseDelay     time.Duration
+	BreakerFailureThreshold int
+	BreakerCooldown         time.Duration
 
 	// Level 2 — statistical (EWMA z-score)
 	EWMAAlpha           float64
@@ -41,7 +47,13 @@ func loadConfig() Config {
 		TopicDeadLetter: envStr("KAFKA_TOPIC_DEAD_LETTER", "dead-letter"),
 
 		PostgresDSN:         envStr("ANOMALY_POSTGRES_DSN", "postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable"),
+		PostgresMaxConns:    envInt("ANOMALY_POSTGRES_MAX_CONNS", 5),
 		CatalogRefreshEvery: time.Duration(envInt("ANOMALY_CATALOG_REFRESH_SECONDS", 300)) * time.Second,
+
+		KafkaMaxRetries:         envInt("ANOMALY_KAFKA_MAX_RETRIES", 5),
+		KafkaRetryBaseDelay:     time.Duration(envInt("ANOMALY_KAFKA_RETRY_BASE_MS", 1000)) * time.Millisecond,
+		BreakerFailureThreshold: envInt("ANOMALY_BREAKER_THRESHOLD", 5),
+		BreakerCooldown:         time.Duration(envInt("ANOMALY_BREAKER_COOLDOWN_S", 15)) * time.Second,
 
 		EWMAAlpha:           envFloat("ANOMALY_EWMA_ALPHA", 0.1),
 		ZScoreThreshold:     envFloat("ANOMALY_ZSCORE_THRESHOLD", 3.0),

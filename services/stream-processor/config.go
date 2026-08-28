@@ -29,6 +29,8 @@ type Config struct {
 
 	InfluxMaxRetries        int
 	InfluxRetryBaseDelay    time.Duration
+	KafkaMaxRetries         int
+	KafkaRetryBaseDelay     time.Duration
 	BreakerFailureThreshold int
 	BreakerCooldown         time.Duration
 
@@ -64,6 +66,8 @@ func loadConfig() Config {
 
 		InfluxMaxRetries:        envInt("STREAM_INFLUX_MAX_RETRIES", 5),
 		InfluxRetryBaseDelay:    time.Duration(envInt("STREAM_INFLUX_RETRY_BASE_MS", 1000)) * time.Millisecond,
+		KafkaMaxRetries:         envInt("STREAM_KAFKA_MAX_RETRIES", 5),
+		KafkaRetryBaseDelay:     time.Duration(envInt("STREAM_KAFKA_RETRY_BASE_MS", 1000)) * time.Millisecond,
 		BreakerFailureThreshold: envInt("STREAM_BREAKER_THRESHOLD", 5),
 		BreakerCooldown:         time.Duration(envInt("STREAM_BREAKER_COOLDOWN_S", 15)) * time.Second,
 

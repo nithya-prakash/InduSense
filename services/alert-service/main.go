@@ -42,17 +42,16 @@ func main() {
 	}
 	defer shutdownTracing(context.Background())
 
-	pool, err := pgxpool.New(ctx, cfg.PostgresDSN)
+	pool, err := newPostgresPool(ctx, cfg.PostgresDSN, cfg.PostgresMaxConns)
 	if err != nil {
 		log.Fatalf("alert-service: connect to postgres: %v", err)
 	}
 	defer pool.Close()
 
-	rules, err := newRuleCache(ctx, cfg.PostgresDSN)
+	rules, err := newRuleCache(ctx, pool)
 	if err != nil {
 		log.Fatalf("alert-service: load initial rule cache: %v", err)
 	}
-	defer rules.close()
 	go runRuleRefresher(ctx, cfg, rules)
 
 	store := newAlertStore(pool)
@@ -67,7 +66,7 @@ func main() {
 	go runEscalationSweeper(ctx, cfg, store, kio, providers)
 	go runIncidentGaugeRefresher(ctx, pool)
 
-	startHealthServer(cfg.HTTPPort)
+	startHealthServer(cfg.HTTPPort, pool)
 	log.Printf("alert-service: health/metrics server listening on :%s", cfg.HTTPPort)
 
 	var wg sync.WaitGroup
@@ -84,6 +83,19 @@ func main() {
 	log.Printf("alert-service: consuming %s and %s as group %s", cfg.TopicAnomalies, cfg.TopicDeviceEvents, cfg.ConsumerGroupID)
 	wg.Wait()
 	log.Println("alert-service: shutdown complete")
+}
+
+// newPostgresPool opens the single connection pool this service uses for
+// Postgres (shared by the alert store, incident store, and rule cache),
+// sized explicitly via maxConns rather than pgxpool's own default
+// (max(4, NumCPU) — see ALERT_POSTGRES_MAX_CONNS in .env.example).
+func newPostgresPool(ctx context.Context, dsn string, maxConns int) (*pgxpool.Pool, error) {
+	poolCfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	poolCfg.MaxConns = int32(maxConns)
+	return pgxpool.NewWithConfig(ctx, poolCfg)
 }
 
 func buildProviders(cfg Config) []NotificationProvider {

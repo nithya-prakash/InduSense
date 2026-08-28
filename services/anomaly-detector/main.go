@@ -37,7 +37,7 @@ func main() {
 	}
 	defer shutdownTracing(context.Background())
 
-	cat, err := newCatalog(ctx, cfg.PostgresDSN)
+	cat, err := newCatalog(ctx, cfg.PostgresDSN, cfg.PostgresMaxConns)
 	if err != nil {
 		log.Fatalf("anomaly-detector: failed to load initial catalog: %v", err)
 	}
@@ -53,7 +53,7 @@ func main() {
 	go runForestTrainer(ctx, cfg, fs, forests)
 	go runLagReporter(ctx, kio)
 
-	startHealthServer(cfg.HTTPPort, forests)
+	startHealthServer(cfg.HTTPPort, cat, kio, forests)
 	log.Printf("anomaly-detector: health/metrics server listening on :%s", cfg.HTTPPort)
 
 	log.Printf("anomaly-detector: consuming %s as group %s", cfg.TopicProcessed, cfg.ConsumerGroupID)
@@ -162,6 +162,20 @@ func processMessage(ctx context.Context, cfg Config, kio *kafkaIO, cat *catalog,
 
 	for _, r := range results {
 		metricAnomaliesDetected.WithLabelValues(r.Method).Inc()
+	}
+
+	claimed, err := claimTelemetryEventOnce(ctx, cat.pool, evt.EventID)
+	if err != nil {
+		logging.WithContext(ctx, logger).Error("idempotency claim failed, leaving unacked for retry", "error", err, "event_id", evt.EventID, "device_id", evt.DeviceID)
+		return false
+	}
+	if !claimed {
+		// Kafka redelivered a telemetry.processed message we already ran
+		// detection for (e.g. after a crash between publish and commit) —
+		// re-publishing would create a second AnomalyDetected, and
+		// downstream, a second alert/incident, for the same reading.
+		logging.WithContext(ctx, logger).Info("duplicate telemetry event, anomaly already published, skipping re-publish", "event_id", evt.EventID, "device_id", evt.DeviceID)
+		return true
 	}
 
 	severity, score, methods, reason := combineDetections(results)

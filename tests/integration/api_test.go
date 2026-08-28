@@ -13,13 +13,14 @@ package integration
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const demoPassword = "ChangeMe123!"
@@ -29,6 +30,83 @@ func baseURL() string {
 		return v
 	}
 	return "http://localhost:8080"
+}
+
+func redisAddr() string {
+	host := "localhost"
+	if v := os.Getenv("REDIS_HOST"); v != "" {
+		host = v
+	}
+	port := "6379"
+	if v := os.Getenv("REDIS_PORT"); v != "" {
+		port = v
+	}
+	return host + ":" + port
+}
+
+// testRedisClient is a package-level client (set up in TestMain, closed
+// after m.Run()) so flushRateLimitBuckets can be called cheaply from every
+// login() call without reconnecting each time. Left nil if Redis isn't
+// reachable at startup, in which case flushRateLimitBuckets is a no-op and
+// individual tests' own live-stack checks (e.g. requireLiveAPI) still
+// handle an unreachable environment gracefully.
+var testRedisClient *redis.Client
+
+// TestMain flushes this API's rate-limit buckets before any test in this
+// package runs, and wires up flushRateLimitBuckets (called from login, see
+// below) for the rest of the run. The rate limiter itself is correct and
+// untouched here — the problem this works around is test isolation:
+// tests/integration and tests/e2e both log in against the real api
+// service, which keys its atomic Redis rate limiter by real client IP (see
+// clientIPResolver in services/api/middleware.go — trusting a spoofed
+// X-Forwarded-For was the actual vulnerability an earlier fix closed, so
+// tests can no longer use a fake per-request IP to dodge this the way they
+// once did). Without isolation, two consecutive `go test ./...`
+// invocations — or, just as easily, two repetitions within one `-count=N`
+// invocation, since TestMain and its `m.Run()` only wrap the *whole* run
+// once, not each repetition — inherit earlier counters on the same
+// 60-second window and see spurious 429s. Not a rate-limiter bug, a
+// shared-state one. The flush only ever touches "ratelimit:*" keys
+// (self-expiring counters, not business data) on whatever Redis this test
+// environment already points at.
+func TestMain(m *testing.M) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	client := redis.NewClient(&redis.Options{Addr: redisAddr()})
+	if client.Ping(ctx).Err() == nil {
+		testRedisClient = client
+	} else {
+		client.Close()
+	}
+	cancel()
+
+	code := m.Run()
+	if testRedisClient != nil {
+		testRedisClient.Close()
+	}
+	os.Exit(code)
+}
+
+// flushRateLimitBuckets clears every rate-limit counter so the call that
+// follows always starts from a clean budget — see TestMain for why a
+// single flush at process start isn't enough on its own (it doesn't cover
+// repetitions within one `-count=N` run, or a test elsewhere in the
+// package, like TestRateLimit_LoginEndpoint_EventuallyReturns429, that
+// deliberately exhausts the same bucket). Called from login() rather than
+// once per test so every login attempt — regardless of which test, which
+// repetition, or what ran immediately before it — gets its own clean shot,
+// without changing what the rate limiter itself does or how many requests
+// it takes to trip it.
+func flushRateLimitBuckets(t *testing.T) {
+	t.Helper()
+	if testRedisClient == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	iter := testRedisClient.Scan(ctx, 0, "ratelimit:*", 0).Iterator()
+	for iter.Next(ctx) {
+		testRedisClient.Del(ctx, iter.Val())
+	}
 }
 
 func requireLiveAPI(t *testing.T) string {
@@ -46,21 +124,6 @@ func requireLiveAPI(t *testing.T) string {
 	return url
 }
 
-// testClientIP hands each test its own synthetic client IP (RFC 5737
-// TEST-NET-3, guaranteed never a real address) for the login rate
-// limiter's X-Forwarded-For-keyed bucket. Every test in this package logs
-// in from the same test-runner IP; without this, one test's login calls
-// count against the same 10/min bucket every other test's login() depends
-// on, so two test runs within the same minute (or one test that
-// deliberately exhausts the limit) make unrelated tests fail with 429
-// instead of the status code they're actually checking for.
-var ipCounter atomic.Int64
-
-func testClientIP() string {
-	n := ipCounter.Add(1)
-	return fmt.Sprintf("203.0.113.%d", n%250+1)
-}
-
 type tokenResponse struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
@@ -76,16 +139,22 @@ type errorEnvelope struct {
 // login returns a fresh access token for the given demo user, failing the
 // test (not skipping) if the seeded credentials don't work — that's a real
 // regression, not an environment problem.
-func login(t *testing.T, url, clientIP, email, password string) string {
+//
+// This package used to give each test its own synthetic X-Forwarded-For
+// identity so login()'s use of the "auth" rate-limit bucket wouldn't
+// interfere between tests. That trick relied on the API trusting a
+// client-supplied header for its own rate-limit key — exactly the spoofing
+// vulnerability the pre-GitHub audit found and pkg fix #1 closed. With the
+// header now correctly ignored by default (clientIPResolver in
+// services/api/middleware.go), every request in this package legitimately
+// shares one real-IP bucket, same as it would for any real client. See
+// TestRateLimit_LoginEndpoint_EventuallyReturns429's comment for how this
+// package now avoids self-interference without relying on spoofing.
+func login(t *testing.T, url, email, password string) string {
 	t.Helper()
+	flushRateLimitBuckets(t)
 	body, _ := json.Marshal(map[string]string{"email": email, "password": password})
-	req, err := http.NewRequest(http.MethodPost, url+"/api/v1/auth/login", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("build login request for %s: %v", email, err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Forwarded-For", clientIP)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.Post(url+"/api/v1/auth/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("login request for %s: %v", email, err)
 	}
@@ -103,14 +172,13 @@ func login(t *testing.T, url, clientIP, email, password string) string {
 	return tok.AccessToken
 }
 
-func authedGet(t *testing.T, url, path, clientIP, token string) *http.Response {
+func authedGet(t *testing.T, url, path, token string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, url+path, nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("X-Forwarded-For", clientIP)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)
@@ -120,7 +188,7 @@ func authedGet(t *testing.T, url, path, clientIP, token string) *http.Response {
 
 func TestLogin_ValidCredentials_ReturnsTokens(t *testing.T) {
 	url := requireLiveAPI(t)
-	token := login(t, url, testClientIP(), "admin@musterfabrik-gmbh.de", demoPassword)
+	token := login(t, url, "admin@musterfabrik-gmbh.de", demoPassword)
 	if len(token) < 20 {
 		t.Errorf("access token looks too short to be a real JWT: %q", token)
 	}
@@ -128,11 +196,9 @@ func TestLogin_ValidCredentials_ReturnsTokens(t *testing.T) {
 
 func TestLogin_WrongPassword_Returns401(t *testing.T) {
 	url := requireLiveAPI(t)
+	flushRateLimitBuckets(t) // makes its own raw request rather than calling login(), so it needs its own clean budget
 	body, _ := json.Marshal(map[string]string{"email": "admin@musterfabrik-gmbh.de", "password": "definitely-wrong"})
-	req, _ := http.NewRequest(http.MethodPost, url+"/api/v1/auth/login", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Forwarded-For", testClientIP())
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := http.Post(url+"/api/v1/auth/login", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("login request: %v", err)
 	}
@@ -183,7 +249,6 @@ func TestProtectedEndpoint_MalformedToken_Returns401(t *testing.T) {
 // Dresden, Munich, Hamburg, ...).
 func TestTenantIsolation_FactoriesScopedToOrganization(t *testing.T) {
 	url := requireLiveAPI(t)
-	ip := testClientIP()
 
 	type factory struct {
 		ID   string `json:"id"`
@@ -195,7 +260,7 @@ func TestTenantIsolation_FactoriesScopedToOrganization(t *testing.T) {
 	}
 
 	fetchFactories := func(token string) []factory {
-		resp := authedGet(t, url, "/api/v1/factories?limit=100", ip, token)
+		resp := authedGet(t, url, "/api/v1/factories?limit=100", token)
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("GET /api/v1/factories: expected 200, got %d", resp.StatusCode)
@@ -207,8 +272,8 @@ func TestTenantIsolation_FactoriesScopedToOrganization(t *testing.T) {
 		return p.Items
 	}
 
-	org1Token := login(t, url, ip, "admin@musterfabrik-gmbh.de", demoPassword)
-	org2Token := login(t, url, ip, "admin@zweite-firma-gmbh.de", demoPassword)
+	org1Token := login(t, url, "admin@musterfabrik-gmbh.de", demoPassword)
+	org2Token := login(t, url, "admin@zweite-firma-gmbh.de", demoPassword)
 
 	org1Factories := fetchFactories(org1Token)
 	org2Factories := fetchFactories(org2Token)
@@ -235,10 +300,9 @@ func TestTenantIsolation_FactoriesScopedToOrganization(t *testing.T) {
 // about the permission, not a coincidentally-invalid request.
 func TestRBAC_ViewerCannotProvisionDevice_AdminCan(t *testing.T) {
 	url := requireLiveAPI(t)
-	ip := testClientIP()
 
-	viewerToken := login(t, url, ip, "viewer@musterfabrik-gmbh.de", demoPassword)
-	adminToken := login(t, url, ip, "admin@musterfabrik-gmbh.de", demoPassword)
+	viewerToken := login(t, url, "viewer@musterfabrik-gmbh.de", demoPassword)
+	adminToken := login(t, url, "admin@musterfabrik-gmbh.de", demoPassword)
 
 	body := []byte(`{"machine_id":"00000000-0000-0000-0000-000000000000","serial_number":"SN-RBAC-TEST-DOES-NOT-EXIST"}`)
 
@@ -246,7 +310,6 @@ func TestRBAC_ViewerCannotProvisionDevice_AdminCan(t *testing.T) {
 		req, _ := http.NewRequest(http.MethodPost, url+"/api/v1/devices", bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Forwarded-For", ip)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("POST /api/v1/devices: %v", err)
@@ -267,23 +330,41 @@ func TestRBAC_ViewerCannotProvisionDevice_AdminCan(t *testing.T) {
 	}
 }
 
-// TestRateLimit_LoginEndpoint_EventuallyReturns429 fires more login
-// attempts than the configured per-minute limit (default 10, from
-// API_RATE_LIMIT_AUTH_PER_MIN) from its own synthetic client IP and
-// asserts at least one is rejected. It checks "at least one 429 among N
-// attempts" rather than "exactly the Nth request" to stay robust against
-// the fixed-window limiter's minute-boundary edge case.
+// TestRateLimit_LoginEndpoint_EventuallyReturns429 fires far more login
+// attempts than the configured per-minute limit (default 30, from
+// API_RATE_LIMIT_AUTH_PER_MIN — see docker-compose.yml's comment on that
+// var for why it isn't the code default of 10) and asserts at least one is
+// rejected. Deliberately runs last in this file: every other test's real
+// login() calls in this package (5 total) share the same real-IP "auth"
+// bucket as this test now that spoofing a different identity via
+// X-Forwarded-For no longer works (correctly — see login()'s doc comment)
+// — running this one last means it only ever burns budget that's no
+// longer needed by anything else in this package. The loop bound of 60 is
+// a safety margin, not the actual cost: the loop breaks the instant it
+// sees a 429, so it only ever consumes ~(limit+1) real attempts in
+// practice.
+//
+// Known, accepted consequence, not a bug: this test's whole job is to
+// legitimately exhaust the real-IP "auth" bucket, so running this package's
+// tests twice within the same 60-second window will make the second run's
+// normal logins also see 429s until the window rolls over. That's the rate
+// limiter correctly doing its job — a control that could be reset on
+// demand by test tooling wouldn't be much of a control. This is a real
+// property of testing a real rate limiter, not something to engineer
+// around; CI runs the suite once per invocation, so it isn't affected.
 func TestRateLimit_LoginEndpoint_EventuallyReturns429(t *testing.T) {
 	url := requireLiveAPI(t)
-	ip := testClientIP()
+	// Starting from a known-clean budget makes this test's own outcome
+	// deterministic too: it always needs the real, configured
+	// API_RATE_LIMIT_AUTH_PER_MIN attempts to trip 429, not "however many
+	// were already used up by whatever ran before it" — without touching
+	// the limit itself or how the limiter decides to trip.
+	flushRateLimitBuckets(t)
 
 	body, _ := json.Marshal(map[string]string{"email": "rate-limit-probe@musterfabrik-gmbh.de", "password": "wrong"})
 	saw429 := false
-	for i := 0; i < 20; i++ {
-		req, _ := http.NewRequest(http.MethodPost, url+"/api/v1/auth/login", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Forwarded-For", ip)
-		resp, err := http.DefaultClient.Do(req)
+	for i := 0; i < 60; i++ {
+		resp, err := http.Post(url+"/api/v1/auth/login", "application/json", bytes.NewReader(body))
 		if err != nil {
 			t.Fatalf("login attempt %d: %v", i, err)
 		}
@@ -294,7 +375,7 @@ func TestRateLimit_LoginEndpoint_EventuallyReturns429(t *testing.T) {
 		}
 	}
 	if !saw429 {
-		t.Error("expected at least one 429 Too Many Requests among 20 rapid login attempts, got none")
+		t.Error("expected at least one 429 Too Many Requests among 60 rapid login attempts, got none")
 	}
 }
 

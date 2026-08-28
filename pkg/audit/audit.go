@@ -1,7 +1,14 @@
-// Package audit writes security-sensitive actions to the audit_logs table —
-// logins, credential rotations, alert/incident modifications, admin
-// actions, DLQ retry/discard — so they can be reconstructed later
-// regardless of which service performed them.
+// Package audit writes security-sensitive actions to the audit_logs table.
+// Currently used only by pkg/auth, for exactly three actions: user.login
+// (success and failure, with a reason), user.refresh_token_reuse (a reused
+// refresh token JTI — a signal of a possibly-stolen token), and
+// user.logout. Nothing else in the codebase calls into this package yet —
+// device credential rotation, alert/incident modifications, and admin
+// actions are not audited today, and there is no dead-letter-queue admin
+// functionality to audit in the first place (see "Dead-letter queue" in
+// README.md). Extending coverage to those would mean calling
+// Logger.Log from the relevant handlers; this package's shape doesn't
+// need to change to support that, there's just no caller yet.
 package audit
 
 import (

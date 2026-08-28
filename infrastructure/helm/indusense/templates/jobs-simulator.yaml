@@ -28,7 +28,8 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           env:
             - name: SIM_POSTGRES_DSN
-              value: {{ include "indusense.postgresDSN" . | quote }}
+              valueFrom:
+                secretKeyRef: { name: {{ .Release.Name }}-secrets, key: POSTGRES_DSN }
             - name: SIM_MQTT_BROKER_URL
               value: "tcp://{{ .Release.Name }}-mosquitto:1883"
             - name: SENSOR_COUNT

@@ -183,9 +183,16 @@ func handleProvisionDevice(pool *pgxpool.Pool) http.HandlerFunc {
 			firmware = "unknown"
 		}
 
+		tx, err := pool.Begin(r.Context())
+		if err != nil {
+			writeInternalError(w, r, err)
+			return
+		}
+		defer tx.Rollback(r.Context()) //nolint:errcheck
+
 		var d deviceDTO
 		var deviceID string
-		err = pool.QueryRow(r.Context(),
+		err = tx.QueryRow(r.Context(),
 			`INSERT INTO devices (machine_id, organization_id, serial_number, status, firmware_version)
 			 VALUES ($1, $2, $3, 'PROVISIONED', $4) RETURNING id, serial_number, status, firmware_version`,
 			req.MachineID, claims.OrganizationID, req.SerialNumber, firmware,
@@ -196,10 +203,15 @@ func handleProvisionDevice(pool *pgxpool.Pool) http.HandlerFunc {
 		}
 		d.ID = deviceID
 
-		if _, err := pool.Exec(r.Context(),
+		if _, err := tx.Exec(r.Context(),
 			`INSERT INTO device_credentials (device_id, credential_type, credential_hash, is_active) VALUES ($1, 'shared_secret', $2, true)`,
 			deviceID, hash,
 		); err != nil {
+			writeInternalError(w, r, err)
+			return
+		}
+
+		if err := tx.Commit(r.Context()); err != nil {
 			writeInternalError(w, r, err)
 			return
 		}

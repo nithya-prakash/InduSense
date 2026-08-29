@@ -21,39 +21,43 @@ jobs:
         with:
           fail_level: error
 
-  lint-go:
-    name: Go fmt / vet / build
+  # A compile-check, not a real linter: ruff/mypy aren't configured yet
+  # (see the migration plan's deferred future-phases list) -- this only
+  # catches syntax errors, the Python equivalent of `go build` failing.
+  # Add ruff/mypy as their own job once they're actually adopted, rather
+  # than bolting on default configs here as a side effect of removing Go.
+  compile-check-python:
+    name: Python compile check
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-python@v5
         with:
-          go-version-file: go.mod
-      - name: gofmt
-        run: |
-          fmt_out="$(gofmt -l .)"
-          if [ -n "$fmt_out" ]; then
-            echo "gofmt found unformatted files:"
-            echo "$fmt_out"
-            exit 1
-          fi
-      - name: go vet
-        run: go vet ./...
-      - name: go build
-        run: go build -o /dev/null ./...
+          python-version: "3.12"
+      - run: python -m compileall -q shared services simulator scripts/seed tests
 
-  govulncheck:
-    name: Go dependency vulnerability scan
+  pip-audit:
+    name: Python dependency vulnerability scan
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      matrix:
+        requirements:
+          - services/ingestion/requirements.txt
+          - services/stream-processor/requirements.txt
+          - services/anomaly-detector/requirements.txt
+          - services/alert-service/requirements.txt
+          - services/api/requirements.txt
+          - simulator/requirements.txt
+          - scripts/seed/requirements.txt
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-python@v5
         with:
-          go-version-file: go.mod
-      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
-      - run: govulncheck ./...
+          python-version: "3.12"
+      - run: pip install -q pip-audit
+      - run: pip-audit -r ${{ matrix.requirements }}
 
   lint-frontend:
     name: Frontend lint / build
@@ -82,16 +86,22 @@ jobs:
       - uses: azure/setup-helm@v4
       - run: helm lint infrastructure/helm/indusense
 
+  unit-test:
+    name: Python unit tests (no external services required)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [compile-check-python]
+    steps:
+      - uses: actions/checkout@v4
+      - run: make unit-test
+
   test:
     name: Test suite (real infra via docker compose)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [lint-go]
+    needs: [compile-check-python]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
 
       - name: Configure environment
         run: make setup
@@ -102,8 +112,11 @@ jobs:
       - name: Seed demo data
         run: make seed
 
-      - name: Run the full Go test suite (unit, integration, contract, e2e)
-        run: go test ./... -race -count=1 -timeout=5m
+      - name: Run contract, integration, and e2e suites against the real stack
+        run: |
+          make contract-test
+          make integration-test
+          make e2e-test
 
       - name: Dump service logs on failure
         if: failure()
@@ -124,7 +137,7 @@ jobs:
     name: Build and push images to GHCR
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [lint-go, lint-frontend, lint-helm, test]
+    needs: [unit-test, lint-frontend, lint-helm, test]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read

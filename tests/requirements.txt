@@ -1,0 +1,21 @@
+# Superset of every Python service's own requirements.txt, plus test-only
+# tools -- this image is the Python-rewrite's replacement for what a
+# single `go test ./...` got for free from one go.mod covering the whole
+# repo. Used to run pytest against ANY directory here: a single service's
+# own tests/, shared/tests, or the cross-service suites in this directory
+# (contract/integration/e2e).
+pytest==8.3.3
+PyJWT==2.9.0
+bcrypt==4.2.0
+confluent-kafka==2.6.1
+fastapi==0.115.5
+influxdb-client==1.45.0
+opentelemetry-exporter-otlp-proto-http==1.27.0
+opentelemetry-sdk==1.27.0
+paho-mqtt==2.1.0
+prometheus_client==0.21.0
+psycopg[binary]==3.2.3
+psycopg_pool==3.2.3
+pydantic==2.9.2
+redis==5.2.0
+requests==2.32.3

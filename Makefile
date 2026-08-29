@@ -2,7 +2,7 @@ SHELL := /bin/bash
 COMPOSE := docker compose
 
 .PHONY: setup up down logs ps restart clean \
-        lint test unit-test integration-test contract-test e2e-test \
+        lint test unit-test integration-test contract-test e2e-test build-tests-image \
         seed simulate simulate-docker load-test demo fmt vet migrate-up migrate-down
 
 MIGRATE_IMAGE := migrate/migrate:v4.17.1
@@ -63,35 +63,58 @@ logs:
 ps:
 	$(COMPOSE) ps
 
-## fmt: format all Go code
+TESTS_IMAGE := indusense-tests
+NETWORK := indusense_indusense-net
+TEST_ENV := -e API_BASE_URL=http://api:8080 -e REDIS_HOST=redis -e REDIS_PORT=6379 \
+            -e ALERT_POSTGRES_DSN="postgres://indusense:indusense_dev_password@postgres:5432/indusense?sslmode=disable" \
+            -e SIM_MQTT_BROKER_URL=tcp://mosquitto:1883
+
+## fmt/vet: no-ops kept for muscle memory -- there's no Go left to format
+# or vet. Python-side static checks (ruff/mypy) aren't wired up yet; add
+# them here when they are.
 fmt:
-	go fmt ./...
+	@echo "no Go left to format (see build-tests-image for the Python test image instead)"
 
-## vet: static analysis
 vet:
-	go vet ./...
+	@echo "no Go left to vet (see build-tests-image for the Python test image instead)"
 
-## lint: fmt + vet (golangci-lint added in a later phase)
+## lint: fmt + vet (currently no-ops, see above)
 lint: fmt vet
 
-## unit-test: run Go unit tests (no external services required)
-unit-test:
-	go test ./... -short -race -count=1
+## build-tests-image: build the shared Python test image (every service's
+## combined dependencies + pytest) used by every target below
+build-tests-image:
+	docker build -q -t $(TESTS_IMAGE) -f tests/Dockerfile .
+
+## unit-test: run each Python service's own pytest suite (services/*/tests,
+## shared/tests, simulator/tests, scripts/seed/tests), no external
+## services required. Run one at a time, not combined into a single pytest
+## invocation: several services declare same-named local modules
+## (config.py, main.py, ...) that would collide in one process's module
+## cache if imported together -- separate invocations are what keeps each
+## service's tests isolated to its own modules, the way separate Go
+## packages were.
+unit-test: build-tests-image
+	@for dir in shared services/ingestion services/stream-processor services/anomaly-detector services/alert-service services/api simulator scripts/seed; do \
+		echo "=== $$dir ==="; \
+		docker run --rm --entrypoint python3 $(TESTS_IMAGE) -m pytest $$dir/tests -v || exit 1; \
+	done
 
 ## test: alias for unit-test
 test: unit-test
 
-## integration-test: run integration tests against real infra (Testcontainers)
-integration-test:
-	go test ./tests/integration/... -race -count=1
+## integration-test: run integration tests against the real running stack
+integration-test: build-tests-image
+	docker run --rm --network $(NETWORK) --entrypoint python3 $(TEST_ENV) $(TESTS_IMAGE) -m pytest tests/integration -v
 
-## contract-test: run schema/contract tests between services
-contract-test:
-	go test ./tests/contract/... -race -count=1
+## contract-test: run schema/contract tests between services (no live
+## stack needed -- pure wire-format checks against shared.events)
+contract-test: build-tests-image
+	docker run --rm --entrypoint python3 $(TESTS_IMAGE) -m pytest tests/contract -v
 
-## e2e-test: run the full end-to-end pipeline test
-e2e-test:
-	go test ./tests/e2e/... -race -count=1 -timeout=5m
+## e2e-test: run the full end-to-end pipeline test against the real running stack
+e2e-test: build-tests-image
+	docker run --rm --network $(NETWORK) --entrypoint python3 $(TEST_ENV) $(TESTS_IMAGE) -m pytest tests/e2e -v
 
 ## seed: seed organizations/factories/machines/devices/sensors into Postgres
 #

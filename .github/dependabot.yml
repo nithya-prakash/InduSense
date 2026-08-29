@@ -1,12 +1,37 @@
 version: 2
 updates:
-  - package-ecosystem: gomod
-    directory: /
+  - package-ecosystem: pip
+    directory: /services/ingestion
     schedule:
       interval: weekly
-    groups:
-      go-dependencies:
-        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /services/stream-processor
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /services/anomaly-detector
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /services/alert-service
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /services/api
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /simulator
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /scripts/seed
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /tests
+    schedule:
+      interval: weekly
 
   - package-ecosystem: npm
     directory: /frontend

@@ -1,14 +1,21 @@
-FROM golang:1.25-alpine AS build
+FROM python:3.12-slim AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY pkg/ ./pkg/
-COPY services/ingestion/ ./services/ingestion/
-RUN CGO_ENABLED=0 go build -o /out/ingestion ./services/ingestion
+COPY services/ingestion/requirements.txt ./requirements.txt
+RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt
 
-FROM alpine:3.20
-RUN adduser -D -u 10001 appuser
+FROM python:3.12-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -m appuser
+COPY --from=build /venv /venv
+WORKDIR /app
+COPY shared/ ./shared/
+COPY services/ingestion/ ./services/ingestion/
+ENV PATH="/venv/bin:${PATH}" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED=1
 USER appuser
-COPY --from=build /out/ingestion /usr/local/bin/ingestion
+WORKDIR /app/services/ingestion
 EXPOSE 8081
-ENTRYPOINT ["/usr/local/bin/ingestion"]
+ENTRYPOINT ["python", "main.py"]

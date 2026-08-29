@@ -1,14 +1,21 @@
-FROM golang:1.25-alpine AS build
+FROM python:3.12-slim AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY pkg/ ./pkg/
-COPY services/api/ ./services/api/
-RUN CGO_ENABLED=0 go build -o /out/api ./services/api
+COPY services/api/requirements.txt ./requirements.txt
+RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt
 
-FROM alpine:3.20
-RUN adduser -D -u 10001 appuser
+FROM python:3.12-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -m appuser
+COPY --from=build /venv /venv
+WORKDIR /app
+COPY shared/ ./shared/
+COPY services/api/ ./services/api/
+ENV PATH="/venv/bin:${PATH}" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED=1
 USER appuser
-COPY --from=build /out/api /usr/local/bin/api
+WORKDIR /app/services/api
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/api"]
+ENTRYPOINT ["python", "main.py"]

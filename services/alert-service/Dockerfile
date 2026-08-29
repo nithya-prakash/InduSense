@@ -1,14 +1,21 @@
-FROM golang:1.25-alpine AS build
+FROM python:3.12-slim AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY pkg/ ./pkg/
-COPY services/alert-service/ ./services/alert-service/
-RUN CGO_ENABLED=0 go build -o /out/alert-service ./services/alert-service
+COPY services/alert-service/requirements.txt ./requirements.txt
+RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt
 
-FROM alpine:3.20
-RUN adduser -D -u 10001 appuser
+FROM python:3.12-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -m appuser
+COPY --from=build /venv /venv
+WORKDIR /app
+COPY shared/ ./shared/
+COPY services/alert-service/ ./services/alert-service/
+ENV PATH="/venv/bin:${PATH}" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED=1
 USER appuser
-COPY --from=build /out/alert-service /usr/local/bin/alert-service
+WORKDIR /app/services/alert-service
 EXPOSE 8084
-ENTRYPOINT ["/usr/local/bin/alert-service"]
+ENTRYPOINT ["python", "main.py"]

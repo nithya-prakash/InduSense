@@ -425,6 +425,31 @@ services:
     networks: [indusense-net]
 
   # ---------------------------------------------------------------------------
+  # Demo-data seed — on-demand only (not part of `docker compose up`).
+  # Run with `make seed` or `docker compose --profile seed up --build seed`.
+  # A container, not a local `python3` invocation, because it depends on
+  # psycopg/bcrypt, which the host's local Python toolchain can't install
+  # (see the Python-rewrite build notes on local-Python-vs-Docker parity).
+  # ---------------------------------------------------------------------------
+  seed:
+    build:
+      context: .
+      dockerfile: scripts/seed/Dockerfile
+    container_name: indusense-seed
+    mem_limit: 256m
+    profiles: ["seed"]
+    environment:
+      SEED_POSTGRES_DSN: postgres://${POSTGRES_USER:-indusense}:${POSTGRES_PASSWORD:-indusense_dev_password}@postgres:5432/${POSTGRES_DB:-indusense}?sslmode=disable
+      SEED_POSTGRES_MAX_CONNS: ${SEED_POSTGRES_MAX_CONNS:-4}
+      SEED_LINES_PER_FACTORY: ${SEED_LINES_PER_FACTORY:-5}
+      SEED_MACHINES_PER_LINE: ${SEED_MACHINES_PER_LINE:-10}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *default-logging
+    networks: [indusense-net]
+
+  # ---------------------------------------------------------------------------
   # Sensor simulator — on-demand only (not part of `docker compose up`).
   # Run with `make simulate` or `docker compose --profile simulate up simulator`.
   # ---------------------------------------------------------------------------

@@ -1,13 +1,17 @@
-FROM golang:1.25-alpine AS build
+FROM python:3.12-slim AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY pkg/ ./pkg/
-COPY scripts/seed/ ./scripts/seed/
-RUN CGO_ENABLED=0 go build -o /out/seed ./scripts/seed
+COPY scripts/seed/requirements.txt ./requirements.txt
+RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt
 
-FROM alpine:3.20
-RUN adduser -D -u 10001 appuser
+FROM python:3.12-slim
+RUN useradd -u 10001 -m appuser
+COPY --from=build /venv /venv
+WORKDIR /app
+COPY shared/ ./shared/
+COPY scripts/seed/ ./scripts/seed/
+ENV PATH="/venv/bin:${PATH}" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED=1
 USER appuser
-COPY --from=build /out/seed /usr/local/bin/seed
-ENTRYPOINT ["/usr/local/bin/seed"]
+WORKDIR /app/scripts/seed
+ENTRYPOINT ["python", "main.py"]

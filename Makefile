@@ -3,7 +3,7 @@ COMPOSE := docker compose
 
 .PHONY: setup up down logs ps restart clean \
         lint test unit-test integration-test contract-test e2e-test \
-        seed simulate load-test demo fmt vet migrate-up migrate-down
+        seed simulate simulate-docker load-test demo fmt vet migrate-up migrate-down
 
 MIGRATE_IMAGE := migrate/migrate:v4.17.1
 POSTGRES_DSN := postgres://indusense:indusense_dev_password@postgres:5432/indusense?sslmode=disable
@@ -111,19 +111,21 @@ e2e-test:
 # traffic, landing inside that rebalance window and timing out even
 # though the pipeline was working correctly, just not fully stood up yet.
 seed:
-	SEED_POSTGRES_DSN="postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable" go run ./scripts/seed
+	$(COMPOSE) --profile seed up --build seed
 	$(COMPOSE) restart anomaly-detector alert-service
 	sleep 5
 
-## simulate: run the sensor simulator against MQTT (Ctrl+C for graceful shutdown)
+## simulate: run the sensor simulator as a container against the compose network
+#
+# Always container-based, even for "local" use: the simulator depends on
+# psycopg/paho-mqtt, which the host's local Python toolchain can't
+# reliably install (see the Python-rewrite build notes). There is no
+# bare-host equivalent anymore the way `go run ./simulator` was.
 simulate:
-	SIM_POSTGRES_DSN="postgres://indusense:indusense_dev_password@localhost:5432/indusense?sslmode=disable" \
-	SIM_MQTT_BROKER_URL="tcp://localhost:1883" \
-	go run ./simulator
-
-## simulate-docker: run the simulator as a container against the compose network
-simulate-docker:
 	$(COMPOSE) --profile simulate up --build simulator
+
+## simulate-docker: alias for `simulate` (kept for muscle memory / old docs)
+simulate-docker: simulate
 
 ## load-test: run all k6 load tests against the running stack (requires `make seed`)
 load-test:

@@ -3,30 +3,24 @@
 InduSense is a production-grade, event-driven monitoring platform for a
 (fictional) German manufacturing company operating multiple factories. It
 ingests real-time telemetry from thousands of machine sensors, detects
-abnormal behavior, raises alerts, and manages incidents — end to end, through
-real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
-
-> **Status: 16 of 18 planned areas complete, most recently CI/CD.** This
-> README will be expanded as each area lands. See [docs/](docs/) for
-> architecture, ADRs, and reliability notes as they are written.
+abnormal behavior, raises alerts, and manages incidents — end to end,
+through real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
 ## Why this project exists
 
 This is a portfolio project built to demonstrate real competence in
 distributed systems, event-driven architecture, and applied backend
-engineering — the kind of system design a Backend/Distributed Systems
-Engineer role at a German industrial company would actually require. It
-prioritizes:
+engineering. It prioritizes:
 
 - **correctness over feature count**
 - **working integrations over buzzwords**
 - **measured performance over invented benchmarks**
 
 Nothing here is faked. If a capability isn't implemented or a number hasn't
-been measured, it's marked `NOT IMPLEMENTED` or `NOT YET MEASURED` rather than
-claimed.
+been measured, it's marked `NOT IMPLEMENTED` or `NOT YET MEASURED` rather
+than claimed.
 
-## Architecture (target — being built incrementally)
+## Architecture
 
 ```text
 Sensor Simulator (1000+ sensors)
@@ -53,1111 +47,65 @@ InfluxDB  Kafka   Notifications
         PostgreSQL
              │
              ▼
-        FastAPI-style REST/WebSocket API (Go)
+        FastAPI REST/WebSocket API
              │
              ▼
         Next.js Dashboard
 ```
 
-## Why Go
-
-Go was chosen for the backend services because this project is meant to
-demonstrate concurrency, high-throughput networking, and efficient,
-cloud-native deployment — goroutines and channels map directly onto the
-worker-pool / bounded-queue patterns needed for MQTT ingestion and Kafka
-consumption, and static binaries make container images small and startup
-fast. See `docs/ADR-004-why-go.md` (added once ADRs are written later on).
-
-## Foundation
-
-Infrastructure is defined in [docker-compose.yml](docker-compose.yml) and has
-been started and functionally verified (not just container-healthy):
-
-| Component  | Verified |
-|------------|----------|
-| PostgreSQL 16 | ✅ query executed (`SELECT version()`) |
-| Redis 7 | ✅ `SET`/`GET` round trip |
-| Eclipse Mosquitto 2.0 (MQTT) | ✅ pub/sub round trip on a test topic |
-| Apache Kafka 3.7 (KRaft, single node) | ✅ all 8 topics created; produce/consume round trip on `telemetry.raw` |
-| InfluxDB 2.7 | ✅ `/health` returned `ready for queries and writes` |
-| Kafka UI | ✅ running at http://localhost:8089 |
-
-Kafka topics created (see [infrastructure/docker/kafka-init-topics.sh](infrastructure/docker/kafka-init-topics.sh)):
-`telemetry.raw` (12 partitions), `telemetry.processed` (12), `anomalies.detected` (6),
-`alerts` (6), `incidents` (3), `device.events` (3), `audit.events` (3), `dead-letter` (3).
-
-Telemetry topics are partitioned by `device_id` (to be enforced by the
-ingestion service, see Ingestion below) so that events for a given device
-are strictly ordered, while different devices process in parallel across
-partitions.
-
-## Domain
-
-19 PostgreSQL tables created via 8 [golang-migrate](https://github.com/golang-migrate/migrate)
-migrations in [migrations/](migrations/): the factory hierarchy
-(`organizations` → `factories` → `production_lines` → `machines` → `devices`
-→ `sensors`), auth/RBAC scaffolding (`users`, `roles`, `permissions`,
-`role_permissions`, `user_roles` — populated in Authentication below), `device_credentials`,
-`alert_rules`/`alerts`, `incidents`/`incident_events`, `maintenance_records`,
-`audit_logs`, and `idempotency_keys`. 60 indexes/constraints total, including
-partial-unique indexes enforcing "one active credential per device" and "one
-active incident per machine" at the database level.
-
-[scripts/seed](scripts/seed/main.go) seeds a realistic hierarchy — one
-organization ("Musterfabrik GmbH") across 4 German factories (Berlin,
-Dresden, Munich, Hamburg), each with 5 production lines of 10 machines drawn
-from 5 realistic industrial machine profiles (CNC mill, hydraulic press,
-conveyor belt, welding robot, air compressor), each machine with one
-provisioned device and 5 sensors — **1000 sensors total**, verified by
-running the seed against live Postgres. The seed is idempotent (checks for
-an existing organization slug) and transactional (a mid-seed failure leaves
-zero partial rows, verified by injecting a duplicate-key failure). Device
-credentials are bcrypt-hashed before storage — the plaintext secret exists
-only transiently in memory during provisioning.
-
-```bash
-make migrate-up    # apply migrations
-make seed          # seed the factory hierarchy
-make unit-test     # go test ./...
-```
-
-## Sensor Simulation
-
-[simulator/](simulator/) is a standalone Go binary that loads the 1000 seeded
-sensors from Postgres and publishes realistic telemetry over real MQTT
-(Eclipse Mosquitto) — verified with a live broker, not mocked. Each of the
-1000 sensors runs as its own goroutine with a per-sensor baseline that drifts
-slowly within its operating range (bounded random walk with reversion toward
-the midpoint) plus gaussian noise; 200 machine-controller goroutines
-independently drive RUNNING/STOPPED transitions per device.
-
-Configurable fault injection (`ANOMALY_RATE`, `DUPLICATE_RATE`,
-`OUT_OF_ORDER_RATE`, `NETWORK_DELAY_RATE`, `SENSOR_FAILURE_RATE` — all in
-[.env.example](.env.example)) was verified to produce rates matching
-configuration (e.g. at 5% each: duplicates landed at ~5.0%, out-of-order at
-~5.2%, anomalies at ~4.7%, over a live 10-second run). A bounded channel
-(`SIM_QUEUE_CAPACITY`, default 20000) between sensor goroutines and a fixed
-pool of MQTT publisher workers provides backpressure — if publishing can't
-keep up, new samples are dropped (counted, not silently lost, and never
-causing unbounded memory growth) rather than queued indefinitely. Graceful
-shutdown on `SIGINT`/`SIGTERM` was verified to drain in-flight sensors and
-disconnect cleanly.
-
-Published topics:
-- `factory/{factory_id}/machine/{machine_id}/sensor/{sensor_id}/telemetry` — the telemetry event itself
-- `factory/{factory_id}/machine/{machine_id}/status` — RUNNING/STOPPED transitions
-- `factory/{factory_id}/machine/{machine_id}/events` — `SENSOR_FAILURE`, `SENSOR_RECOVERED`, `MACHINE_STOPPED`, `MACHINE_RUNNING`
-
-```bash
-make simulate          # run natively against localhost infra (Ctrl+C to stop gracefully)
-make simulate-docker   # run as a container on the compose network (profile: simulate)
-```
-
-## Ingestion
-
-[services/ingestion](services/ingestion/) bridges MQTT and Kafka:
-`MQTT (manual ack) → validate → normalize → Kafka`, with a bounded worker
-pool (`INGESTION_WORKER_POOL_SIZE`, default 50) reading off a bounded queue
-(`INGESTION_QUEUE_CAPACITY`, default 10000) fed by the MQTT subscriber. It
-never touches Postgres or InfluxDB directly — that's the stream processor's
-job (see Streaming below).
-
-**How at-least-once delivery is actually implemented here**, not just
-claimed: the MQTT client uses `CleanSession(false)` (persistent session) and
-disables auto-ack (`SetAutoAckDisabled(true)`); a message is only acked
-after it's durably handed to Kafka — either published to `telemetry.raw` /
-`device.events`, or, on Kafka failure, successfully routed to `dead-letter`
-instead. If *both* the primary topic and the dead-letter write fail (Kafka
-is entirely unreachable), the message is deliberately left unacked.
-
-This was verified live, not just reasoned about: with Kafka stopped, a
-telemetry event was published over MQTT. Ingestion retried with exponential
-backoff (1s/2s/4s/8s), attempted dead-letter, failed that too (Kafka down
-means both paths are down), and correctly left the message unacked instead
-of dropping it. Kafka was brought back up, ingestion was restarted (killed
-and relaunched — the "consumer crashes and restarts" scenario), and the
-persistent MQTT session **redelivered the still-unacked message on
-reconnect** — no data loss across a real Kafka outage plus a real process
-restart. It arrived as **two duplicate copies** a fraction of a millisecond
-apart (visible in Kafka by `ingested_at`), which is exactly why the
-architecture is built around idempotent consumers rather than a promise that
-duplicates can't happen — deduplication by `event_id` is the stream
-processor's job (see Streaming below), not ingestion's.
-
-Also verified live: malformed telemetry (invalid UUID) is validated at the
-boundary and routed to `dead-letter` with the original payload, an
-`error`/`error_type`/`processing_stage`, and a `correlation_id` — then
-acked, since the failure is durably captured. A circuit breaker
-(`CircuitBreaker` in [pkg/reliability](pkg/reliability/breaker.go), states
-CLOSED/OPEN/HALF_OPEN, unit-tested including the half-open trial-success and
-trial-failure transitions) wraps every Kafka write so a sustained outage
-fails fast instead of retrying every message into a struggling broker —
-shared by every service that writes to Kafka or InfluxDB (see
-`kafkaIO`/`influxSink` in ingestion, stream-processor, and
-anomaly-detector).
-
-```bash
-curl localhost:8081/live      # process liveness — never fails on a dependency
-curl localhost:8081/ready     # false if MQTT is disconnected or the Kafka breaker is OPEN
-curl localhost:8081/metrics   # Prometheus: messages_received/processed/failed_total, dlq_messages_total, mqtt_connections, processing_latency_seconds
-```
-
-## Streaming
-
-[services/stream-processor](services/stream-processor/) consumes
-`telemetry.raw`, deduplicates by `event_id`, writes each reading to
-InfluxDB, maintains rolling windowed aggregates, and republishes to
-`telemetry.processed` for the anomaly detector (see Anomaly Detection below):
-
-```text
-telemetry.raw → dedup (Redis SETNX) → InfluxDB raw point → windowed aggregation → InfluxDB agg point → telemetry.processed
-```
-
-**Deduplication** claims each `event_id` in Redis (`SETNX` + TTL) *before*
-processing; a duplicate is skipped without repeating the InfluxDB write or
-aggregate update, but its offset is still committed. This is the mechanism
-that would have caught the literal duplicate produced live during
-Ingestion's own verification above (the MQTT-redelivery duplicate from the
-Kafka-outage test) — verified again here
-with a fresh run: `duplicate_events_total` incremented for real duplicates
-generated by the simulator's `DUPLICATE_RATE`.
-
-**Windowed aggregation** (`window.go`) keeps a per-`(device_id, metric)`
-ring buffer trimmed to the longest configured window (15m) and computes
-moving average, moving standard deviation, min, max, and rate of change
-(the same computation covers "vibration trend" and "energy consumption
-rate" from the spec — those are just `rate_of_change` applied to the
-vibration/power metrics, not separate calculations). A background ticker
-flushes aggregates for all five windows (10s/30s/1m/5m/15m) as one batched
-InfluxDB write every 10s. Verified live: with real telemetry flowing,
-`sensor_telemetry_agg` points appeared in InfluxDB with correct
-`moving_avg`/`min`/`max`/`count` values, tagged by window.
-
-**Ordered by event time, not arrival order.** The ring buffer is kept
-sorted by each reading's own `timestamp` field regardless of the order
-messages are actually consumed in — a pre-GitHub audit found `add()`
-simply appending on arrival, which corrupted both the trim logic (it only
-scans from the front, assuming ascending order) and rate-of-change's
-"first vs. last sample" reasoning whenever the simulator's
-`OUT_OF_ORDER_RATE` (network delay) or ordinary Kafka redelivery caused a
-reading to arrive later than one with an earlier timestamp. Insertion is
-O(distance from the correct position) rather than O(1) append, which is
-the right trade for a bounded ring buffer where out-of-order arrivals are
-the exception, not the norm.
-
-**Consumption is deliberately single-goroutine per instance** — `FetchMessage`
-and `CommitMessages` run sequentially so offset commits always advance in
-the order messages were actually processed (a pool of goroutines committing
-concurrently could commit a higher offset before a lower one finishes,
-silently skipping that message on a crash). Scaling beyond one instance's
-throughput is the standard Kafka answer — more partitions, more
-consumer-group members — not more goroutines racing to commit.
-
-**InfluxDB writes are naturally idempotent**: the same `(measurement, tags,
-timestamp)` overwrites rather than duplicates, so even if Redis dedup were
-bypassed, telemetry records themselves can't become duplicated — Redis
-dedup exists to avoid wasted work and to protect the aggregates/republish
-step from double-counting, not because the storage layer would otherwise
-corrupt itself. This is explicitly documented rather than assumed, per the
-project's at-least-once-plus-idempotency stance (see the note at the bottom
-of this README).
-
-Retries with backoff and a circuit breaker (shared `pkg/reliability`, also
-used by ingestion) wrap every InfluxDB write; on exhaustion the message is
-routed to `dead-letter` (verified live: a deliberately malformed message on
-`telemetry.raw` was caught, dead-lettered, and its offset committed).
-Aggregate writes are best-effort (logged, not dead-lettered) since they're
-recomputable observability data, not a primary business record — a
-scope decision documented in code rather than left implicit.
-
-Its Kafka publish to `telemetry.processed` gets the same retry+breaker
-protection (`kafkaIO.protectedWrite` in `kafka.go`) — a pre-GitHub audit
-found this path, and the equivalent one in anomaly-detector, publishing
-directly with no protection at all, inconsistent with every other external
-call in the codebase. `dead-letter` writes are deliberately left
-unprotected in both, matching ingestion's existing convention: if Kafka is
-down entirely, there's nothing more to do but leave the source message
-uncommitted for redelivery once it recovers, so retrying the dead-letter
-write too would just be wasted latency. `kafka_circuit_breaker` is
-reported by `/ready` alongside `influxdb_circuit_breaker`.
-
-**Telemetry retention: 30 days (720h) in the reference deployment.** The
-`telemetry` bucket's retention is set via `INFLUXDB_RETENTION` (default
-`720h`) at first-time InfluxDB setup — see `docker-compose.yml`. This only
-applies when the `influxdb-data` volume is created fresh; InfluxDB does not
-retroactively apply `DOCKER_INFLUXDB_INIT_RETENTION` to an already-existing
-bucket. To change retention on a running deployment, look up the bucket ID
-and update it directly (`influx bucket update` takes `--id`, not a bucket
-name):
-
-```bash
-docker exec indusense-influxdb influx bucket list --org indusense --token "$INFLUXDB_TOKEN"
-docker exec indusense-influxdb influx bucket update \
-  --id <telemetry-bucket-id> --token "$INFLUXDB_TOKEN" --retention 720h
-```
-
-Retention is InfluxDB-only and has no effect on PostgreSQL, which retains
-its own data (devices, users, incidents, audit log, etc.) indefinitely.
-
-```bash
-curl localhost:8082/ready     # false if Redis is unreachable or the InfluxDB breaker is OPEN
-curl localhost:8082/metrics   # messages_consumed/failed_total, duplicate_events_total, kafka_consumer_lag, windowed_aggregates_written_total
-```
-
-## Anomaly Detection
-
-[services/anomaly-detector](services/anomaly-detector/) consumes
-`telemetry.processed` and runs three independent detection levels on every
-reading, publishing a combined result to `anomalies.detected` when any
-fire. Full design writeup, including an honest evaluation of the Isolation
-Forest (what was measured vs. not), is in
-[docs/ANOMALY-DETECTION.md](docs/ANOMALY-DETECTION.md).
-
-All three levels were verified firing on live data in a single test run:
-
-```text
-anomalies_detected_total{method="RULE"}              122
-anomalies_detected_total{method="STATISTICAL"}          8
-anomalies_detected_total{method="ISOLATION_FOREST"}     1
-```
-
-- **Rule-based**: value outside the sensor's seeded operating range, severity
-  scaled by overshoot fraction.
-- **Statistical**: EWMA rolling mean/stddev per `(device_id, metric)`,
-  z-score against the pre-sample baseline, suppressed until 30+ samples.
-- **Isolation Forest**: a real implementation (not a wrapped library) of
-  Liu, Ting & Zhou (2008) — verified with a synthetic-data evaluation
-  showing normal points scoring 0.45 vs. outliers scoring 0.68 on average
-  (both correctly on their expected side of the 0.6 anomaly threshold). One
-  forest is trained **per machine type**, not globally, because different
-  machine types report different metric sets — a CNC mill's feature vector
-  isn't the same shape or semantics as a hydraulic press's, so a shared
-  forest would compare incomparable dimensions. All 5 machine-type forests
-  trained successfully from live data in the deployment's first retrain
-  cycle (`ANOMALY_FOREST_RETRAIN_SECONDS`, default 120s).
-
-```bash
-curl localhost:8083/forests    # which machine types currently have a trained forest
-curl localhost:8083/metrics    # anomalies_detected_total{method}, isolation_forests_trained_total
-```
-
-**Idempotency**: publishing to `anomalies.detected` is guarded by an atomic
-claim on the source telemetry event's `event_id`, via the `idempotency_keys`
-table (`services/anomaly-detector/idempotency.go`, scope
-`anomaly_detection`) — the same `INSERT ... ON CONFLICT DO NOTHING RETURNING`
-pattern alert-service uses for alert dedup. Without it, Kafka redelivering a
-`telemetry.processed` message (e.g. after a crash between publishing an
-anomaly and committing its offset) would run detection again and publish a
-second, distinct `AnomalyID` for the same physical reading — and,
-downstream, a second alert/incident. A redelivered event is detected as
-already-claimed and its (still-true) detection result is simply not
-re-published; the offset is still committed, since re-processing would
-reach the same outcome every time.
-
-Publishing to `anomalies.detected` is itself wrapped in the same
-retry-with-backoff-plus-circuit-breaker pattern as stream-processor's
-InfluxDB/Kafka writes (`kafkaIO.protectedWrite` in `kafka.go`) — see
-`/ready`'s `kafka_circuit_breaker` field. `dead-letter` writes are left
-unprotected, matching the same reasoning as elsewhere: a Kafka outage means
-there's nothing left to do but leave the source message uncommitted.
-
-## Alerting
-
-[services/alert-service](services/alert-service/) consumes
-`anomalies.detected` and `device.events`, matches events against
-organization-configured `alert_rules` (Postgres), and creates alerts with
-deduplication, cooldown, and escalation — publishing to the `alerts` Kafka
-topic and notifying via console (always) and an optional webhook.
-
-**Rule matching** (`conditions.go`) supports the four condition types from
-the schema: `GREATER_THAN`/`LESS_THAN`/`OUTSIDE_RANGE` against the anomaly's
-raw value, and `ANOMALY_COUNT` — "N anomalies within a window" — backed by
-an in-memory per-`(rule, device)` timestamp tracker
-(`anomalycount.go`), trimmed to the rule's configured window on every
-insert. Four representative rules ship in the seed data (matching the
-spec's own examples): a hard temperature threshold (90°C, CRITICAL), a
-vibration threshold (HIGH), a power-spike threshold (WARNING), and "three
-temperature anomalies within five minutes" (HIGH) — plus a sentinel rule
-used only by the direct machine-shutdown handler.
-
-**Deduplication + cooldown** (`store.go`): a new alert is refused if one for
-the same `(rule, device, metric)` is still open (an `INSERT ... ON CONFLICT
-... WHERE status = 'OPEN' DO NOTHING` matching the partial unique index
-from the Domain section's schema, so this holds even under concurrent
-processing, not just via an application-level check) — or if the last one
-for that key resolved more recently than the rule's `cooldown_seconds`,
-which is what stops a flapping
-condition from re-paging immediately after resolution. Verified live: of
-109 qualifying anomalies processed in one run, 65 became new alerts and 25
-were correctly suppressed as duplicates of an already-open alert, with zero
-duplicate `OPEN` rows ever present in Postgres (checked directly).
-
-**Escalation**: a periodic sweep bumps any `OPEN` alert unacknowledged past
-`ALERT_ESCALATION_AFTER_SECONDS` (default 900s) one rung up the
-WARNING→HIGH→CRITICAL ladder and re-notifies — verified live with a
-shortened interval, including catching and fixing a real bug in the process
-(a Postgres parameter-encoding failure in the escalation query's interval
-arithmetic, fixed by switching to `make_interval()`).
-
-**Machine shutdown** is a second, independent alert path: `device.events`
-messages with `event_type = MACHINE_STOPPED` go straight to alert creation
-(bypassing rule matching, since it's not a metric threshold), verified live
-end-to-end from a synthetic MQTT publish through ingestion validation to a
-real Postgres alert row and console notification.
-
-**Notification providers** (`notify.go`): `ConsoleProvider` (always on,
-zero external dependencies) and `WebhookProvider` (retry + circuit breaker
-via `pkg/reliability`, optional). A webhook failure is logged and counted,
-never dead-lettered or retried against the message pipeline — the alert
-itself is already durably recorded in Postgres by the time notification is
-attempted, so a webhook outage means a missed notification, not lost alert
-data. Email/Slack are intentionally not implemented (no paid service
-credentials available in this environment) — the `NotificationProvider`
-interface exists specifically so they can be added later without touching
-the alert engine.
-
-```bash
-curl localhost:8084/metrics   # alerts_generated_total{severity}, alerts_suppressed_total{reason}, alerts_escalated_total, notifications_sent_total{provider}
-```
-
-## Incidents
-
-Incident lifecycle management lives in the shared
-[pkg/incidents](pkg/incidents/incidents.go) package — imported by both
-`alert-service` (which opens/attaches incidents from alerts) and `api`
-(which exposes the manual lifecycle actions) — rather than as a separate
-"incident-service" — incidents originate 1:1 from alerts and there
-was no independent workflow to justify a new microservice yet (the spec's
-own service list doesn't name one either). The manual lifecycle actions
-(acknowledge, assign, resolve, close) are implemented and fully tested now
-so the APIs section's REST API can call them directly once there's a human
-operator to invoke them — this section proves the state machine and
-persistence are correct ahead of the API surface that will expose them.
-
-**"Don't create unlimited incidents from repeated alerts"** is enforced at
-the database level, not just in application code: `openOrAttach` reuses any
-incident already active for a machine (`INSERT ... ON CONFLICT (machine_id)
-WHERE status IN (...) DO NOTHING`, racing safely against the same partial
-unique index from the Domain section's schema) and logs a fresh alert as
-an `ALERT_ATTACHED` audit event instead of opening a second incident.
-Verified live: 7 real
-alerts from a fresh traffic burst produced exactly 6 incidents, with 1
-correctly attached rather than duplicated — confirmed directly in Postgres
-with zero machines ever holding more than one active incident.
-
-**State machine** (`OPEN → ACKNOWLEDGED/INVESTIGATING/RESOLVED → CLOSED`,
-with `RESOLVED → INVESTIGATING` allowed for a recurrence but `CLOSED`
-terminal) is unit-tested for every valid and invalid transition, then
-exercised end-to-end against a real Postgres instance in
-[incidents_live_test.go](pkg/incidents/incidents_live_test.go) —
-open, attach, acknowledge, assign, investigate, resolve, reopen, re-resolve,
-close, and verifying a post-closure alert opens a genuinely new incident.
-That test caught two real foreign-key constraints the hard way (an
-`incidents.alert_id` and `assigned_to` must reference *real* `alerts`/
-`users` rows, not placeholder strings) — the schema's referential integrity
-doing exactly its job.
-
-## Authentication
-
-[pkg/auth](pkg/auth/) implements password hashing, JWT issuance/validation,
-RBAC, and multi-tenancy guards as domain logic with no HTTP dependency —
-same pattern as the Alerting and Incidents sections above: build and
-live-verify the logic before the REST API (see APIs below) exists to
-expose it. [pkg/audit](pkg/audit/) is a small
-shared writer for the `audit_logs` table, used by `pkg/auth` today and
-available to any service later.
-
-**RBAC is claims-based, not a database lookup per request**: `Login`
-resolves a user's roles to their full permission set (`RolePermissions` in
-[rbac.go](pkg/auth/rbac.go)) and embeds it directly in the JWT, so
-authorizing a request only requires validating the token, not a
-`role_permissions` join on every call. That same map is also the single
-source of truth the seed script uses to populate `role_permissions` in
-Postgres — verified live to match exactly: ADMIN 11 permissions,
-FACTORY_MANAGER 9, ENGINEER 8, TECHNICIAN 6, VIEWER 5.
-
-**The full auth flow was verified against real Postgres and Redis**, not
-mocked, in [service_live_test.go](pkg/auth/service_live_test.go): login
-with the real seeded admin user, wrong-password and unknown-email
-rejection, refresh-token **rotation** (each refresh both invalidates the
-presented token and issues a new one), reuse-of-a-rotated-out-token
-rejection, and logout revocation — all checked against Redis state, not
-just the code path. The audit trail was checked directly in Postgres:
-successful logins, failed logins, and logouts all produced real
-`audit_logs` rows.
-
-**Multi-tenancy was verified with two real organizations**, not asserted
-against one: the seed script now creates a second organization ("Zweite
-Firma GmbH") with its own factory and admin user specifically so isolation
-has something concrete to fail against. `TestMultiTenantLoginsAreIsolated`
-confirms both organizations' tokens carry distinct `organization_id`
-claims, that `RequireSameOrganization` rejects org A's token against org
-B's resource, and — as a data-layer ground truth check — that no factory
-row's `organization_id` can appear under a different organization's join.
-
-Access tokens are **not** individually revocable (the standard stateless-
-JWT tradeoff), mitigated by a short TTL (`JWT_ACCESS_TTL_MINUTES`, default
-15) rather than pretending server-side revocation of a bearer token is
-free; refresh tokens are revocable because they're tracked in Redis by
-design.
-
-## APIs
-
-[services/api](services/api/) is the REST + WebSocket surface: `pkg/auth`
-and `pkg/incidents` wired into real HTTP middleware, not reimplemented.
-Routing uses the standard library's `net/http.ServeMux` with Go 1.22's
-method+path patterns — a deliberate choice over Gin/Fiber, since this API's
-needs (path params, method routing) are fully covered by the stdlib now,
-and adding a router dependency wouldn't have bought anything.
-
-**Every handler scopes its Postgres/InfluxDB queries by the JWT's
-`organization_id`, never by anything the client supplies.** This was
-verified live, not just written: an org B user listing factories saw only
-their own Stuttgart plant, never org A's four; fetching org A's factory ID
-directly by URL returned `404 NOT_FOUND` (not `403`) — correct behavior,
-since confirming a cross-tenant resource *exists* is itself a leak. RBAC
-was verified the same way: a VIEWER token got `403 FORBIDDEN` provisioning
-a device, `200` reading factories.
-
-**Real bugs were found and fixed during live verification** (all three
-are the kind of thing that only shows up when you actually run the thing):
-1. The Redis-backed rate limiter keyed on `r.RemoteAddr` including the
-   port, which is different on every TCP connection — it silently never
-   limited anything until fixed to strip the port.
-2. `/ws/alerts` failed every upgrade with "response does not implement
-   http.Hijacker" — the logging middleware's `ResponseWriter` wrapper
-   needed to explicitly forward `Hijack()` to the underlying writer, a
-   known gotcha when wrapping `http.ResponseWriter` in front of
-   `gorilla/websocket`.
-3. Unmatched routes returned Go's default plain-text 404 instead of the
-   spec's consistent JSON error envelope — fixed with an explicit
-   catch-all handler.
-
-**The full incident lifecycle was verified through the actual HTTP API**:
-`OPEN → ACKNOWLEDGED` succeeded (204), `ACKNOWLEDGED → CLOSED` was
-correctly rejected (409, skipping straight past RESOLVED), and `GET
-/incidents/{id}` returned the complete audit trail with both transitions.
-Rate limiting was verified by actually hammering `/auth/login` 15 times:
-exactly 10 succeeded, then real `429`s with `Retry-After: 60`.
-
-**`/ws/alerts` streams real-time alerts scoped by organization** — verified
-by connecting two WebSocket clients (org A and org B), publishing an org-A
-alert event, and confirming org A's client received it while org B's
-client received nothing at all after a full 20-second window. Browsers
-can't set a custom `Authorization` header on a WebSocket handshake, so the
-access token is accepted as a `?token=` query parameter on this one
-endpoint specifically — documented as a simplification; a production
-system would issue a short-lived, single-use ws ticket instead of reusing
-a bearer token in a URL.
-
-`GET /docs` serves a hand-written OpenAPI 3.0 spec (24 paths) through
-Swagger UI — hand-written rather than reflection-generated, since a
-generator would add a dependency without saving meaningful effort at this
-API's size, and a hand-written spec can't accidentally document a field
-that wasn't meant to be public.
-
-```bash
-curl -X POST localhost:8080/api/v1/auth/login -d '{"email":"admin@musterfabrik-gmbh.de","password":"ChangeMe123!"}'
-curl localhost:8080/api/v1/factories -H "Authorization: Bearer <token>"
-curl localhost:8080/docs   # Swagger UI
-```
-
-**Not implemented here, honestly deferred rather than rushed**:
-`/ws/incidents` (incidents don't yet publish to their own Kafka topic —
-`pkg/incidents` has a `Publisher` interface ready for this, just not wired
-to a writer); device-count-aware pagination cursors (offset pagination
-only).
-
-### Dead-letter queue
-
-Every service that consumes from Kafka (ingestion, stream-processor,
-anomaly-detector, alert-service) writes malformed or unrecoverably-failed
-messages to the shared `dead-letter` topic — see `pkg/events.DeadLetterRecord`
-for the shape every service uses. **This is write-only: there is no admin
-API, browsing UI, retry mechanism, or automated reprocessing built into
-InduSense itself.** An earlier draft of this README referenced a "DLQ admin
-API" that was never built and doesn't exist — that reference has been
-removed. To actually inspect what's in `dead-letter`, use standard Kafka
-tooling, both already available in this stack:
-
-```bash
-# Kafka UI — browse messages, headers, and offsets in a browser
-open http://localhost:8089    # Topics -> dead-letter -> Messages
-
-# Or from the command line, against the running kafka container:
-docker exec -it indusense-kafka /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic dead-letter --from-beginning
-```
-
-Reprocessing a dead-lettered message today means manually re-publishing its
-`original_payload` to the appropriate source topic by hand — there is no
-one-click retry.
-
-## Dashboard
-
-[frontend/](frontend/) is a Next.js 16 + TypeScript app (App Router,
-Turbopack, Tailwind CSS) covering every page the spec asks for: Overview,
-Factory drill-down, Machine detail with live telemetry charts, Alerts,
-Incidents, Devices, Administration.
-
-**Client-rendered by design, not server components everywhere.** Every
-data-fetching page is a Client Component that calls the REST API directly
-with the browser-held JWT — a deliberate simplification over Next.js
-Server Components/Server Actions, since this app's auth model (bearer
-tokens in `localStorage`, refreshed by the client) doesn't map cleanly onto
-per-request server-side token forwarding without meaningfully more
-plumbing. Dynamic route pages (`/factories/[id]`, `/machines/[id]`,
-`/incidents/[id]`) still follow Next 16's requirement that `params` be
-awaited in an async Server Component — that outer shell just extracts the
-id and hands it to a Client Component.
-
-**RBAC drives the UI, not just the API** — verified live by logging in as
-each of two different roles and confirming the DOM actually differs, not
-just reading the code: as ADMIN, the Alerts page shows "Acknowledge"
-buttons and the Incidents detail page shows an Actions panel; as VIEWER
-(no `alerts:manage`/`incidents:manage`), those controls are simply absent
-while the underlying data remains fully visible — the same
-read-without-write split enforced server-side in the APIs section, now
-visible in the browser.
-
-**The full incident lifecycle was exercised through the actual UI**, not
-just curled: clicking "Move to ACKNOWLEDGED" updated the status badge,
-removed the now-invalid action buttons (only `INVESTIGATING`/`RESOLVED`
-remained, matching the state machine), and appended a real audit-history
-entry with a live timestamp — all sourced from the same Postgres rows
-the APIs section's tests already verified.
-
-**`/ws/alerts` drives a live "● live" indicator and the Alerts table** —
-acknowledging an alert updates its badge immediately via the REST call's
-response, and the WebSocket connection is what the indicator reflects
-(verified by watching it read "○ connecting..." then "● live" as the
-socket came up).
-
-A real bug surfaced immediately by actually loading the page in a browser
-(not by reading the code): the scaffold's default dark-mode CSS block used
-un-layered rules that silently beat every Tailwind utility class regardless
-of specificity, rendering the whole dashboard near-black. Removed in favor
-of an explicitly light-only theme, since no dark theme was designed. A
-second, more subtle one: `create-next-app`'s scaffold put the sidebar's
-`h-screen` on a flex item without `sticky` positioning, which looked fine
-in normal browser scrolling but showed a clipped, overlapping sidebar in a
-full-page (beyond-viewport) screenshot — confirmed as a screenshot-capture
-artifact, not a real user-facing bug, by resizing to a fixed viewport and
-actually scrolling; fixed with `sticky top-0 self-start` regardless, since
-it's the more correct pattern either way.
-
-While building the Factory drill-down page, the frontend surfaced a real
-API gap: there was no endpoint to list a production line's machines. Added
-`GET /api/v1/production-lines/{id}/machines` to `services/api` (see APIs
-above) rather than working around it in the UI — exactly the kind of thing you
-only find by actually using what you built.
-
-```bash
-make up   # frontend included in the default stack
-# http://localhost:3000 — demo login: admin@musterfabrik-gmbh.de / ChangeMe123!
-```
-
-**Not implemented here**: user creation/role-assignment UI (no
-backend endpoint exists yet — the Administration page says so explicitly
-rather than faking one); a chart library beyond Recharts line charts (no
-gauge/heatmap views); offline/optimistic UI for flaky connections.
-
-Not yet built: Grafana/Jaeger, Kubernetes manifests, CI/CD, and
-most formal testing (tests so far are unit tests for pure logic plus
-live-Postgres/Redis integration tests for incidents and auth, plus this
-section's live browser verification — none of which is yet captured as a
-permanent automated test; that's covered in Testing below). These are
-covered in the sections below.
-
-## Observability
-
-Four pillars, all live-verified against real running services rather than
-asserted from reading the code:
-
-**Prometheus** ([infrastructure/prometheus/prometheus.yml](infrastructure/prometheus/prometheus.yml))
-scrapes all five Go services (`api`, `ingestion`, `stream-processor`,
-`anomaly-detector`, `alert-service`) every 10s. Verified via Prometheus's own
-`/api/v1/targets` showing all five as `up`. Two new gauges were added because
-the dashboards needed data the existing metrics didn't expose:
-`devices_by_status` (`services/api`, refreshed from Postgres every 15s) and
-`incidents_open_by_severity` (`services/alert-service`, same pattern) — both
-confirmed with real non-zero values (`devices_by_status{status="ACTIVE"} 169`,
-`incidents_open_by_severity{severity="CRITICAL"} 3`) rather than just
-structurally present. Kafka broker JMX metrics are explicitly **not
-implemented** — no JMX exporter sidecar — and the scrape config says so.
-
-**Grafana** ([infrastructure/grafana/](infrastructure/grafana/)) auto-provisions
-a Prometheus + Jaeger datasource and four dashboards (Platform, Kafka, IoT,
-Anomaly & Alerting) via YAML providers, confirmed present through Grafana's
-own `/api/search`. All four were opened in a real browser and watched respond
-to a real traffic burst generated with the simulator
-(`SENSOR_COUNT=200 MESSAGES_PER_SECOND=200 ANOMALY_RATE=0.1`, 20s): API
-throughput/latency/CPU/memory panels spiked and recovered in sync, Kafka
-consumer lag rose then drained as anomaly-detector and stream-processor
-caught up, and IoT/incident panels tracked the correct live counts — not
-just non-empty charts, but charts whose shape matched a traffic pattern
-I actually caused.
-
-**Structured logging** (`pkg/logging`, a thin `log/slog` JSON handler) is
-wired into the pipeline's key lifecycle events — telemetry/machine-event
-ingested, dedup and validation failures, anomaly detected, alert created,
-incident opened/attached, and every API request — across all five Go
-services. Fields match the spec: `timestamp`, `service`, `level`, `message`,
-plus contextual `event_id`/`device_id`/`organization_id` at each call site
-and `trace_id` whenever the call happens inside a span. This is a
-deliberately partial migration: the remaining ad-hoc `log.Printf` calls
-(mostly startup/shutdown lines and background-refresher failures) were left
-alone rather than converted wholesale, since they carry no per-event fields
-worth structuring.
-
-**OpenTelemetry tracing** (`pkg/tracing`) exports to the Jaeger container
-added in this section, over OTLP/HTTP. Getting this right required one real fix:
-`otlptracehttp.WithEndpointURL` takes the URL's path as-is and does *not*
-default it to `/v1/traces`, so passing `OTEL_EXPORTER_OTLP_ENDPOINT` (an
-OTel-standard base URL with no path) straight through 404'd against Jaeger's
-receiver — switched to `WithEndpoint(host)`, which does apply the default
-path, and confirmed the `traces export: 404` errors stopped appearing in the
-logs. Trace context is propagated by hand across Kafka: a `kafka.Header`
-carrier adapts `propagation.TextMapCarrier` so the standard W3C
-`traceparent` gets injected on every publish (ingestion → telemetry.raw,
-stream-processor → telemetry.processed, anomaly-detector →
-anomalies.detected, alert-service → alerts) and extracted on every consume.
-The `api` service gets per-request spans via `otelhttp` middleware instead,
-since HTTP tracing is a standard, separate concern from the Kafka pipeline.
-
-Verified live end-to-end, not just "the exporter didn't error": after a
-simulator run, Jaeger's `/api/services` listed all five real services, and
-querying `/api/traces` for a single trace ID found a genuine four-span chain
-with correct parent/child relationships and monotonically increasing start
-times — `ingestion.process_message` (root) → `stream_processor.process`
-(child) → `anomaly_detector.detect` (child of that) →
-`alert_service.process_anomaly` (child of that) — meaning a `traceparent`
-header genuinely rode across three separate Kafka hops and was correctly
-extracted each time, not just three isolated same-ID spans. The same trace
-ID also showed up verbatim in that request's structured log line
-(`anomaly-detector`'s "anomaly detected" record), confirming logs and traces
-share an ID a reader could actually pivot between.
-
-**Not implemented here**: tracing on the frontend (no browser-side
-OTel SDK); log shipping to any aggregator (Loki, ELK) — logs are stdout-only,
-collected by `docker compose logs`; Prometheus alerting rules (Alertmanager)
-— Grafana dashboards exist but no alert *rules* fire from Prometheus itself,
-only from `alert-service`'s own domain logic; and most `log.Printf` call
-sites outside the lifecycle events above remain unstructured, as noted.
-These, along with Kubernetes manifests and CI/CD, are covered in the
-sections below.
-
-## Testing
-
-[Makefile](Makefile)'s `unit-test`/`integration-test`/`contract-test`/`e2e-test`
-targets were scaffolded back in the Foundation section pointing at
-`tests/integration/`, `tests/contract/`, and `tests/e2e/` — this section is
-what actually populates them, on top of the unit and live-infra tests
-already written incrementally in the sections above (`pkg/auth`,
-`pkg/incidents`, and per-service pure-logic tests). All four tiers, run
-together, are what `make test` now covers.
-
-**Contract tests** ([tests/contract/](tests/contract/)) lock the JSON wire
-format of every event type in `pkg/events` — `NormalizedTelemetryEvent`,
-`NormalizedMachineEvent`, `AnomalyDetected`, `AlertEvent`,
-`DeadLetterRecord` — against a fixed expected payload, round-tripped in both
-directions (struct→JSON and back). There's no schema registry or
-consumer-driven-contract framework (Pact) in this stack, so this is a
-narrower, honest substitute: it can't catch "the consumer expected a field
-the producer stopped sending" across a deploy it doesn't have, but it does
-turn "someone renamed `DeviceID` to `Device_Id` in the shared struct" from a
-silent runtime failure in some *other* service into an immediate, local test
-failure. Fast and infra-free by design — no skip logic needed.
-
-**Integration tests** ([tests/integration/](tests/integration/)) hit the
-real running `api` container over HTTP against real Postgres/Redis — not a
-mocked handler test — using the demo data `scripts/seed` already puts there.
-The centerpiece is `TestTenantIsolation_FactoriesScopedToOrganization`: it
-logs in as both seeded organizations' admins for real and asserts
-`zweite-firma-gmbh` never sees `musterfabrik-gmbh`'s factories (or vice
-versa) — proving the "every query scopes by the JWT's `organization_id`"
-claim from the APIs section against live data, not by re-reading the query.
-Alongside it: RBAC (`VIEWER` gets 403 on `POST /api/v1/devices` before the
-handler body even runs; `ADMIN` reaches business validation instead),
-login success/failure, unauthenticated/malformed-token rejection, and rate
-limiting.
-
-Writing the rate-limit test surfaced a real test-suite bug, not a product
-bug: the login endpoint's limiter buckets by client IP
-(`X-Forwarded-For`-aware), and every test in the package logged in from the
-same test-runner IP — so a test that deliberately exhausts the limit (or
-just two `make test` runs within the same 60s window) made *unrelated*
-tests fail with 429 instead of the status they were actually checking.
-Fixed by giving each test its own synthetic `X-Forwarded-For` (RFC 5737
-TEST-NET-3, never a real address) — confirmed by running the full suite
-twice back to back with no interference, where it previously failed on the
-second run.
-
-**End-to-end tests** ([tests/e2e/](tests/e2e/)) are the ones that actually
-justify an event-driven architecture existing at all: they publish a real
-MQTT message to the same Mosquitto broker ingestion subscribes to, and poll
-the real API until the effect that message should have propagates all the
-way through — nothing mocked, stubbed, or short-circuited anywhere in
-between.
-
-- `TestE2E_TelemetryRoundTrip` looks up a real seeded sensor from Postgres,
-  publishes an in-range reading over MQTT, and polls
-  `GET /api/v1/telemetry/latest` until that exact value comes back —
-  proving MQTT → ingestion → Kafka → stream-processor → InfluxDB → API.
-- `TestE2E_AnomalyTriggersAlert` publishes `temperature=150` (the seeded
-  "High temperature" rule fires above 90) and polls `GET /api/v1/alerts`
-  for the resulting `CRITICAL` alert — proving MQTT → ingestion → Kafka →
-  anomaly-detector's rule check → alert-service's rule match → Postgres →
-  API, the platform's actual reason for existing. Both passed in under a
-  second end to end against the real stack — a genuine (if informal, not a
-  load test) latency data point for the Load Testing section below.
-
-Getting the alert test to run reliably took a second, more interesting
-fix: `zweite-firma-gmbh` (seeded purely for the tenant-isolation test
-above) turned out to have no devices or sensors of its own — only a bare
-factory/machine — so it couldn't be used to publish telemetry at all.
-Rather than reuse a `musterfabrik-gmbh` device that might already be on
-that rule's alert cooldown from earlier simulator runs (which would make
-the test flaky depending on unrelated history), the test picks a device
-dynamically via `NOT EXISTS (SELECT 1 FROM alerts WHERE device_id = ... AND
-title = 'High temperature')` — always a device this specific rule has never
-fired for yet, so there's no cooldown state to race against, and the query
-is naturally self-renewing across repeated runs.
-
-**Not implemented here**: consumer-driven contract testing (Pact
-or similar) — the contract tests here are schema-locking, not full
-consumer-driven contracts; frontend tests (no Jest/Playwright suite yet);
-`go tool cover` coverage numbers for `services/api`/`ingestion`/etc. remain
-low (~3–30%) despite the new integration/E2E coverage, because those tests
-exercise the already-running Docker container over the network — coverage
-instrumentation only counts code paths executed inside the same test
-binary process, so real, meaningful HTTP-level test coverage of the API
-doesn't show up in that number at all. Worth stating plainly rather than
-letting a low percentage look like an untested service, or citing test
-counts as if they meant something they don't. Kubernetes manifests, CI/CD,
-and load testing are covered in the sections below.
-
-## Kubernetes + Helm
-
-[infrastructure/helm/indusense/](infrastructure/helm/indusense/) is a Helm
-chart that deploys the entire stack — every StatefulSet, Deployment, and
-one-time setup Job docker-compose.yml already defines — as a single
-release, without changing a line of application code: every Go service's
-`config.go` just reads environment variables, and doesn't know or care
-whether Compose or Kubernetes set them.
-
-**Verified against a real cluster, start to finish**, not `helm template`
-alone: Docker Desktop's Kubernetes (kind-based, 1 node), a completely fresh
-`helm install --set seed.enabled=true` converging to all 15 pods `Running`
-in **66 seconds wall-clock**, real demo data landing in Postgres (2 orgs, 6
-users, 200 devices, 1000 sensors — via the same `scripts/seed` binary,
-rebuilt as a container image for the first time here), a real login
-returning a genuine JWT through a `kubectl port-forward`'d API, and —
-firing the in-cluster simulator Job — the full pipeline processing real
-traffic: stream-processor consuming 1734 messages, anomaly-detector
-detecting 131 anomalies and generating 26 real alerts (8 CRITICAL / 13 HIGH
-/ 5 WARNING) with genuine reasoning text ("value 90.64 outside safe
-operating range [20.00, 90.00]; z-score 3.80 exceeds threshold 3.00..."),
-all visible through the actual API. Grafana came up with all 4 dashboards
-provisioned from the same JSON as Compose, Prometheus showed all 5 Go
-services `up`, and Jaeger recorded real traces from all 5 — proving the
-Observability section's stack works identically under Kubernetes DNS names
-with zero code changes.
-
-**Three real bugs were found and fixed by actually deploying, not by
-reading the YAML:**
-
-1. **Kafka wouldn't start: a headless-Service DNS chicken-and-egg.** Kafka's
-   own KRaft controller-registration step needs to resolve its advertised
-   name (`indusense-kafka:9093`) *during startup, before the broker is
-   Ready* — but a headless Service excludes not-yet-Ready pods from DNS by
-   default, so the broker could never resolve itself and crash-looped
-   forever. Fixed with `publishNotReadyAddresses: true` on Kafka's Service,
-   the standard fix for this exact problem in self-registering StatefulSet
-   members (Kafka, Cassandra, etcd, ZooKeeper all hit it).
-2. **Kafka's health probes always failed, even once healthy.**
-   `kafka-broker-api-versions.sh` boots a fresh JVM on every invocation —
-   routinely well over Kubernetes' 1-second default probe timeout. Fixed
-   with an explicit `timeoutSeconds: 10`.
-3. **LoadBalancer Services never got an external IP, and worse, blocked
-   `helm uninstall`.** Docker Desktop's Kubernetes is kind-based with no
-   cloud-provider-kind/MetalLB, so `api`/`frontend`'s LoadBalancer Services
-   sat at `<pending>` forever — and their
-   `service.kubernetes.io/load-balancer-cleanup` finalizer then blocked
-   namespace deletion until manually patched off. Switched the default to
-   `ClusterIP` + `kubectl port-forward`; a NodePort was the other option,
-   but its 30000-32767 range can't reproduce port 8080, which the frontend
-   image already has `NEXT_PUBLIC_API_BASE_URL=http://localhost:8080` baked
-   into at build time (Next.js inlines `NEXT_PUBLIC_*` vars into the client
-   bundle) — forcing a rebuild just for Kubernetes would have broken the
-   one-image-both-substrates property this chart was designed around.
-
-**A fourth issue was observed, not chart-level, and resolved itself:** on
-the very first install (before the Kafka probe-timeout fix), Kafka's own
-instability during startup left `stream-processor`'s Kafka reader
-genuinely stuck — joined its consumer group, then never issued another
-fetch, with `messages_consumed_total` stuck at 0 even though the topic had
-over a thousand real messages waiting. A pod restart immediately fixed it.
-Re-tested after the probe fix, across a completely fresh install with no
-manual intervention: the pipeline processed traffic correctly on the first
-try. The stuck reader was very likely a downstream symptom of Kafka's own
-instability, not an independent bug — but a production hardening step
-worth naming honestly: a liveness check tied to consumer progress (not
-just process-alive) would catch this class of failure without a human
-watching metrics.
-
-**Migrations and topic creation as Helm hooks**
-([templates/jobs-migrate.yaml](infrastructure/helm/indusense/templates/jobs-migrate.yaml),
-[templates/jobs-kafka-topics.yaml](infrastructure/helm/indusense/templates/jobs-kafka-topics.yaml))
-run `post-install,pre-upgrade` — deliberately not `pre-install`, which was
-the first thing tried and immediately failed: a pre-install hook runs
-*before* the release's own Postgres/Kafka StatefulSets exist, so the
-migration Job's wait-for-postgres initContainer had nothing to poll.
-Migrations get baked into a small custom image
-([infrastructure/docker/migrate/Dockerfile](infrastructure/docker/migrate/Dockerfile))
-rather than mounted from a ConfigMap — a 1MiB size limit and decoupling the
-schema from the image that applies it are both real problems a ConfigMap
-would have created. The Kafka topics script, at under 30 lines, doesn't
-carry that argument and is mounted from a ConfigMap instead.
-
-**Demo data seeding**
-([templates/jobs-seed.yaml](infrastructure/helm/indusense/templates/jobs-seed.yaml))
-reuses `scripts/seed` unmodified, containerized for the first time here.
-It's a `post-install,post-upgrade` hook, off by default
-(`seed.enabled=false`) — the first version was `post-install`-only, which
-seemed like the more disciplined choice (why reseed an already-seeded
-database on every upgrade?) until it became clear that also meant the
-documented way to seed *after* the fact — `helm upgrade --set
-seed.enabled=true` — silently did nothing, since post-install hooks never
-fire on upgrades. `scripts/seed` was already fully idempotent from the
-Foundation section, so the fix cost nothing: add `post-upgrade` too.
-
-**Traffic generation runs inside the cluster**
-([templates/jobs-simulator.yaml](infrastructure/helm/indusense/templates/jobs-simulator.yaml)),
-unlike Compose's simulator profile, which runs from the host machine. This
-isn't a shortcut — it's a real constraint: Kafka's advertised listener only
-resolves inside the cluster (see bug #1's fix), so a client outside it
-would get broker metadata pointing at a hostname it can't reach. The Job is
-bounded with `activeDeadlineSeconds` rather than a duration flag, since the
-simulator binary itself has none — it normally runs until SIGTERM, exactly
-like the Compose version.
-
-**Not implemented here**: an ingress controller/Ingress resource
-(written and gated behind `ingress.enabled=false`, since Docker Desktop's
-Kubernetes has none installed by default — untested against a real one);
-Kafka/Postgres clustering or multi-replica stateful components (every
-StatefulSet stays at 1 replica, matching docker-compose's topology exactly
-rather than pretending this chart does something it doesn't); Horizontal
-Pod Autoscaling; NetworkPolicies. `api` runs 2 replicas behind its Service
-as the one genuinely meaningful horizontal-scaling demonstration, since
-it's the only stateless service worth the point. These, along with CI/CD,
-are covered in the remaining sections below.
-
-## Load Testing
-
-[load-tests/](load-tests/) has three k6 scripts, each testing a different
-resource shape rather than one script trying to cover everything. All
-numbers below are **measured, not invented** — real `k6 run` output against
-the actual running docker-compose stack on this machine, one API replica,
-demo data from `make seed`. They're single-machine numbers (the k6 client
-and the whole stack share the same laptop's CPU), so treat them as
-functional/correctness proof and relative comparisons, not a production
-capacity number — a real capacity benchmark needs the load generator on
-separate hardware from the system under test, which this setup can't
-provide and doesn't claim to.
-
-**[dashboard-read-load.js](load-tests/dashboard-read-load.js)** simulates
-50 concurrent logged-in operators polling the same endpoints the real
-dashboard calls (factories, devices, alerts, a device's latest telemetry),
-each 1-3 seconds — not a tight request loop. Device/metric pairs are
-discovered from the live API in `setup()` rather than hardcoded, since
-Postgres-generated UUIDs differ on every fresh seed. Sustained for 40s
-after a 20s ramp-up:
-
-- **76-78 req/s aggregate throughput**, ~5600 requests total per run
-- **p95 latency 6.4-6.5ms overall**; by endpoint, p95 factories 2.8-3.1ms,
-  devices 1.9-2.1ms, alerts 1.9-2.1ms, telemetry_latest 9.6-10.0ms (the
-  one endpoint that queries InfluxDB via Flux rather than Postgres — the
-  gap is real and expected)
-- **99.92-100% of checks passed**; the API container's own memory stayed
-  under 40MiB throughout, CPU negligible
-
-The 0.19-0.26% of requests that did fail turned out to be worth digging
-into rather than waving off: every single one was a genuine `429
-RATE_LIMITED` from the default endpoint's 120 req/min-per-identity limiter
-(confirmed by logging response bodies in a debug run), not an application
-error. Each simulated operator gets its own stable synthetic
-`X-Forwarded-For` identity for the whole test — deliberately, since 50
-concurrent browser tabs are 50 different real clients each with their own
-budget, not one client making 50x the requests, and testing with everyone
-sharing one IP would measure the rate limiter's ceiling instead of the
-API's. At ~4 requests every ~2.4s average, one simulated operator's own
-traffic sits close enough to that 120/min budget that ramp-up timing
-jitter occasionally tips a request over it. That's the limiter doing
-exactly its documented job, at a boundary this test happens to sit near —
-not a bug, and worth stating precisely rather than rounding it off to
-"~100% success."
-
-**[auth-rate-limit.js](load-tests/auth-rate-limit.js)** is the
-complementary, opposite-design test: it deliberately does *not* spread
-identities, firing 30 login attempts from **one** shared synthetic
-identity to prove the 10/min login limiter holds under a real k6-generated
-burst, not just a hand-rolled loop. Measured result: 20 requests got a
-genuine 401 (wrong password) before the budget ran out, then the remaining
-10 correctly got 429 — the limiter enforced exactly as designed under
-real concurrent load.
-
-**[websocket-scale.js](load-tests/websocket-scale.js)** tests the other
-resource shape entirely — long-lived connections, not request/response —
-against `/ws/alerts`, the real-time fan-out from the APIs section. Ramping to 200
-concurrent connections, held open 20s: **100% connected, 100% clean
-close** across 250 completed connection lifecycles (400 attempted; the
-rest were mid-hold when the test's ramp-down began, an expected teardown
-artifact, not a failure), with WebSocket handshake p95 of 3.76-3.86ms even
-at the full 200 concurrent. This measures connection scale, not delivery —
-it doesn't assert every socket receives a specific alert, since that would
-mean coordinating the simulator in lockstep with a scale test that's
-really about "can 200 sockets stay open and healthy"; real message
-delivery over this same endpoint was already proven live in the Dashboard
-section's browser verification of the "● live" indicator.
-
-`make load-test` runs all three against whatever's currently running —
-add k6 to your PATH first (`brew install k6`, or the binary from
-[k6.io](https://k6.io); the version used here was v0.55.0, installed
-without brew since this environment had neither `sudo` nor Homebrew).
-
-**Not implemented here**: a distributed load-generation setup
-(k6 running on separate hardware from the stack, or k6 Cloud) — the
-single-machine caveat above is a direct, honest consequence of not having
-that; MQTT/Kafka pipeline throughput under sustained heavy load specifically
-via k6 (the simulator already exercises that path — see the verification in
-the Sensor Simulation through Anomaly Detection sections above — and k6 has
-no first-class MQTT support without an experimental extension, so
-duplicating that coverage here wasn't worth the added surface); and
-soak/endurance testing (these are all short bursts, not hours-long
-steady-state runs). CI/CD is covered next.
-
-## CI/CD
-
-[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on every push
-and pull request to `main`: parallel lint jobs (`gofmt`/`go vet`/`go build`,
-the frontend's `eslint`/`next build`, `helm lint` on the Kubernetes + Helm
-chart, and `actionlint` on the workflow file itself), then a `test` job that
-spins up the *entire* real stack via `make up` (Postgres, Redis, Kafka,
-Mosquitto, InfluxDB, all five Go services) and runs
-`go test ./... -race -count=1` against it — unit, integration, contract,
-and E2E tests all in the same invocation, exactly as they run locally,
-against real infra rather than a CI-specific mocked substitute. On a push
-to `main` only, once every lint/test job has passed, `publish-images`
-builds and pushes all eight Dockerfiles (five services, migrate, seed,
-frontend) to GHCR, tagged `latest` and the commit SHA — the honest scope
-for "CD" here, since there's no live remote environment for this portfolio
-project to actually deploy the Helm chart into. The Kubernetes + Helm
-section above already proved that chart can consume exactly these image
-names, once someone points `images.*.repository` at
-`ghcr.io/<owner>/indusense-<service>`.
-
-**Verified as thoroughly as it can be without a GitHub remote**: at the
-time of this commit the repository hasn't been pushed anywhere yet, so
-there's no live Actions run to point to — stated plainly rather than
-implied away. What *was* verified for real: `actionlint` against the
-workflow file (catches malformed job graphs, invalid action references,
-bad expression syntax — far more than YAML-syntax checking), and,
-critically, the `test` job's exact command sequence
-(`make setup && make up && make seed && go test ./... -race -count=1
--timeout=5m`) run locally end-to-end from a **completely fresh, empty
-Postgres** — twice — since that's the one condition a long-running local
-dev environment never naturally exercises, and it's exactly the condition
-every CI run starts from.
-
-**Running it for real surfaced two genuine bugs, neither hypothetical:**
-
-1. **`make up` alone couldn't actually stand up a fresh clone.**
-   `anomaly-detector` and `alert-service` both run an eager Postgres query
-   at startup (not a lazy connection), and neither has a restart policy in
-   docker-compose.yml. Against a truly empty database — no schema yet,
-   since migrations were a separate manual step nowhere enforced before
-   the app containers started — both crashed on their very first attempt
-   and, unlike Kubernetes' default crash-loop-and-retry, just stayed
-   `Exited` forever. `make up` now does infra first (`--wait`), then
-   `make migrate-up`, then the app services (`--wait` again) — a two-phase
-   bring-up that mirrors the real dependency graph Compose has no native
-   way to express (it has no equivalent of a Kubernetes Job gating
-   dependent Deployments). This was a **pre-existing gap in the documented
-   quickstart**, not something this fix introduced — the README's
-   original "Local setup" steps never mentioned running migrations at all.
-
-2. **A freshly-seeded database's new devices/rules were invisible to
-   alerting for minutes, not seconds.** `anomaly-detector` caches its
-   Postgres-derived device/sensor catalog and only refreshes it every
-   300s by default; `alert-service` caches alert rules and refreshes
-   every 60s. Both load once, synchronously, at startup — so a service
-   that started against an empty database (the normal case, since
-   seeding happens after `make up`) keeps an empty cache until its next
-   scheduled refresh, regardless of how much real data `make seed` adds
-   in the meantime. `make seed` now restarts both services afterward,
-   which reloads their caches immediately instead of waiting out the
-   interval. That fix immediately surfaced a *third*, more subtle timing
-   issue: neither service's `/ready` endpoint checks Kafka consumer-group
-   state (it never needed to before this), so a test that restarted both
-   services and published traffic moments later could land inside a
-   normal post-restart rebalance window and see nothing — not because the
-   pipeline was broken, but because 20 seconds wasn't a realistic budget
-   for "two Kafka consumers rejoin their groups after a restart."
-   `tests/e2e`'s anomaly-to-alert deadline moved from 20s to 45s, and
-   `make seed` adds a brief settle pause after the restart. Confirmed
-   fixed by running the full suite twice more from completely fresh
-   state — the second run's actual elapsed time (19.1s) landed *inside*
-   the old 20s deadline almost by chance, a good illustration of why the
-   old margin was fragile rather than just "a bit slow once."
-
-**Not implemented here**: an actual live GitHub Actions run (no
-remote configured — the honest reason live verification stops where it
-does here); a CD step that deploys anywhere real (no cluster to deploy the
-Kubernetes + Helm section's chart into outside this laptop); Trivy image
-scanning and CodeQL — genuinely worth adding, not included here for scope
-reasons; and caching Go module/build layers across CI runs beyond what
-`actions/setup-go` already does automatically, and BuildKit's GHA cache
-backend used only in the publish job. DLQ tooling and remaining
-documentation remain potential future work.
-
-### Operational hygiene (post-audit fixes)
-
-A pre-GitHub audit found several small but real operational gaps, all
-fixed and verified against the live stack:
-
-- **`kafka-ui` pinned** to `v0.7.2` (was `:latest`) — confirmed the pinned
-  tag resolves to the exact same image digest already running.
-- **Docker Compose resource limits**: every service now has a `mem_limit`
-  (docker-compose.yml previously had none at all, unlike the Helm chart's
-  per-service `requests`/`limits`, which already existed). Sized as
-  generous safety nets — well above real observed usage (Kafka's steady
-  ~680MB vs. its 2GiB cap) — rather than copying the Helm chart's tighter
-  Kubernetes-sized limits, since those are close enough to real usage that
-  applying them here risked OOM-killing containers on a busy host or a
-  resource-constrained CI runner. Verified live: full stack up, full test
-  suite green, with limits confirmed applied via `docker inspect`.
-- **Grafana credentials**: `GF_SECURITY_ADMIN_USER`/`GF_SECURITY_ADMIN_PASSWORD`
-  were hardcoded directly in docker-compose.yml — every other credential in
-  that file already used the `${VAR:-default}` pattern. Now
-  `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD`, documented in
-  `.env.example`.
-- **`infrastructure/kubernetes/`** — an empty, untracked, never-referenced
-  directory (no git history, not linked from anywhere) — removed.
-- **`govulncheck` added to CI** (a new, independent `govulncheck` job).
-  Running it locally against the pre-audit toolchain found 32 Go standard
-  library CVEs actually reachable from this code, every one already fixed
-  in a later 1.25.x patch — none were bugs in this codebase's own code or
-  in a third-party dependency. `go.mod`'s `go` directive moved from
-  `1.25.0` to `1.25.14` (the latest 1.25.x patch as of this fix — a
-  same-minor-version bump, not a jump to 1.26, to keep this change as small
-  as the fix it's addressing); rebuilding with it brings reachable
-  vulnerabilities to zero. Verified: full test suite (including `-race`)
-  green on the new toolchain, and all five Go service Docker images
-  rebuilt and confirmed healthy against the live stack.
-- **Dependabot** ([.github/dependabot.yml](.github/dependabot.yml)) added
-  for `gomod`, the frontend's `npm`, every Dockerfile's base image, and
-  the workflow file's own GitHub Actions — weekly, grouped per ecosystem.
+## Tech stack
+
+**Backend — Python**, one service per container: FastAPI (`api`), and four
+Kafka-consuming workers (`ingestion`, `stream-processor`,
+`anomaly-detector`, `alert-service`) sharing a small `shared/` package
+(event schemas, circuit breaker/retry, logging, auth, incidents, audit).
+paho-mqtt, confluent-kafka-python, psycopg3, redis-py, influxdb-client,
+PyJWT + bcrypt, prometheus_client, OpenTelemetry.
+
+**Infrastructure**: PostgreSQL, InfluxDB, Redis, Apache Kafka, Eclipse
+Mosquitto — Docker Compose for local dev, Kubernetes + Helm for cluster
+deployment. Prometheus + Grafana + Jaeger for observability.
+
+**Frontend**: Next.js 16 (React 19), TypeScript, Tailwind CSS, Recharts.
+
+**Testing/CI**: pytest (unit/contract/integration/e2e against real infra,
+not mocks), GitHub Actions, pip-audit, Dependabot, k6 load tests.
+
+The backend was originally written in Go and later rewritten entirely to
+Python, service by service, so the project's owner could personally read,
+defend, and maintain every line — see
+[docs/phases/17-python-rewrite.md](docs/phases/17-python-rewrite.md).
+
+## How it was built
+
+The system was built incrementally, one phase at a time, each verified
+live against real infrastructure before the next began. The detailed
+write-up for every phase — architecture decisions, live verification, real
+bugs found and fixed, measured numbers — lives in
+**[docs/phases/](docs/phases/README.md)**:
+
+1. [Foundation](docs/phases/01-foundation.md) · 2. [Domain](docs/phases/02-domain.md) ·
+3. [Sensor Simulation](docs/phases/03-sensor-simulation.md) · 4. [Ingestion](docs/phases/04-ingestion.md) ·
+5. [Streaming](docs/phases/05-streaming.md) · 6. [Anomaly Detection](docs/phases/06-anomaly-detection.md) ·
+7. [Alerting](docs/phases/07-alerting.md) · 8. [Incidents](docs/phases/08-incidents.md) ·
+9. [Authentication](docs/phases/09-authentication.md) · 10. [APIs](docs/phases/10-apis.md) ·
+11. [Dashboard](docs/phases/11-dashboard.md) · 12. [Observability](docs/phases/12-observability.md) ·
+13. [Testing](docs/phases/13-testing.md) · 14. [Kubernetes + Helm](docs/phases/14-kubernetes-helm.md) ·
+15. [Load Testing](docs/phases/15-load-testing.md) · 16. [CI/CD](docs/phases/16-cicd.md) ·
+17. [Python rewrite](docs/phases/17-python-rewrite.md)
+
+See also [docs/ANOMALY-DETECTION.md](docs/ANOMALY-DETECTION.md) for the
+Isolation Forest design and evaluation writeup.
+
+## Delivery semantics (a note up front)
+
+This system is designed around **at-least-once delivery + idempotent
+consumers + deduplication** — not exactly-once semantics across the whole
+distributed pipeline. This is a deliberate, documented tradeoff: Redis
+SETNX-based dedup in stream-processor, an `idempotency_keys`-backed claim in
+anomaly-detector, and alert-service's dedupe-key + cooldown logic. See
+[Streaming](docs/phases/05-streaming.md), [Anomaly Detection](docs/phases/06-anomaly-detection.md),
+and [Alerting](docs/phases/07-alerting.md) for the details.
 
 ## Local setup
 
@@ -1170,23 +118,21 @@ make ps      # check container health
 make down    # stop everything (data volumes preserved)
 ```
 
-Kafka UI: http://localhost:8089
-InfluxDB UI: http://localhost:8086
-API: http://localhost:8080 (Swagger docs at `/docs`)
+Kafka UI: http://localhost:8089 · InfluxDB UI: http://localhost:8086 ·
+API: http://localhost:8080 (Swagger docs at `/docs`) ·
+Dashboard: http://localhost:3000
 
 Demo users (`make seed`), one per role, password `ChangeMe123!` for all —
-**local development only, never used anywhere real credentials would be**:
-`admin@musterfabrik-gmbh.de`, `factory_manager@musterfabrik-gmbh.de`,
-`engineer@musterfabrik-gmbh.de`, `technician@musterfabrik-gmbh.de`,
-`viewer@musterfabrik-gmbh.de`. A second organization
-(`admin@zweite-firma-gmbh.de`, same password) exists specifically for
-multi-tenancy testing.
+**local development only**: `admin@musterfabrik-gmbh.de`,
+`factory_manager@musterfabrik-gmbh.de`, `engineer@musterfabrik-gmbh.de`,
+`technician@musterfabrik-gmbh.de`, `viewer@musterfabrik-gmbh.de`. A second
+organization (`admin@zweite-firma-gmbh.de`, same password) exists
+specifically for multi-tenancy testing.
 
 ### Alternative: Kubernetes + Helm
 
-Same demo users/password as above. Requires a local cluster (Docker
-Desktop's Kubernetes, minikube, or kind) and the app images already built
-locally (`make up` builds them, or `docker compose build`):
+Requires a local cluster (Docker Desktop's Kubernetes, minikube, or kind)
+and the app images already built locally:
 
 ```bash
 docker build -t indusense-migrate:latest -f infrastructure/docker/migrate/Dockerfile .
@@ -1200,8 +146,8 @@ kubectl port-forward -n indusense svc/indusense-api 8080:8080 &
 kubectl port-forward -n indusense svc/indusense-frontend 3000:3000 &
 ```
 
-To generate traffic (has to run as a pod — see the Kubernetes + Helm section
-above for why):
+To generate traffic (has to run as a pod — see
+[Kubernetes + Helm](docs/phases/14-kubernetes-helm.md) for why):
 
 ```bash
 helm upgrade indusense infrastructure/helm/indusense -n indusense \
@@ -1212,51 +158,16 @@ helm upgrade indusense infrastructure/helm/indusense -n indusense \
 
 ```text
 indusense/
-├── services/          # api, ingestion, stream-processor, anomaly-detector, alert-service (Go)
+├── services/          # api, ingestion, stream-processor, anomaly-detector, alert-service (Python)
+├── shared/            # event schemas, reliability, logging, tracing, auth, incidents, audit
 ├── frontend/          # Next.js + TypeScript dashboard
 ├── simulator/         # sensor simulator
 ├── infrastructure/    # docker, kubernetes, helm, prometheus, grafana, jaeger configs
 ├── migrations/        # PostgreSQL schema migrations
-├── tests/             # integration, contract, e2e
+├── tests/             # integration, contract, e2e (pytest)
 ├── load-tests/        # k6 scripts
 ├── scripts/           # dev/ops scripts
-├── docs/              # ANOMALY-DETECTION.md (design + evaluation writeup)
+├── docs/              # phase-by-phase write-ups, design docs
 ├── .github/workflows/ # CI/CD (GitHub Actions)
 └── docker-compose.yml
 ```
-
-## Delivery semantics (a note up front)
-
-This system is designed around **at-least-once delivery + idempotent
-consumers + deduplication** — not exactly-once semantics across the whole
-distributed pipeline. This is a deliberate, documented tradeoff, not an
-oversight. An earlier draft of this README pointed here to a `docs/ADR-005`
-that was planned but never actually written — that link has been removed
-rather than left pointing at a file that doesn't exist. The reasoning itself
-is not missing, just not in a separate ADR: it's the dedup/idempotency
-notes scattered through the Streaming, Anomaly Detection, and Alerting
-sections above (Redis SETNX-based dedup in stream-processor, the
-`idempotency_keys`-backed claim in anomaly-detector, and alert-service's
-dedupe-key + cooldown logic).
-
-## Postgres connection pooling
-
-Every service that talks to Postgres sizes its own `pgxpool.Pool` explicitly
-via a `*_POSTGRES_MAX_CONNS` env var, rather than relying on pgxpool's own
-default of `max(4, NumCPU)` — left unset, pool size would silently vary with
-the host machine instead of being a deliberate choice. Reference-deployment
-defaults, chosen for steady-state load (well under PostgreSQL's own default
-`max_connections=100`, leaving headroom for `psql`/admin sessions and
-one-shot jobs run alongside the long-running services):
-
-| Service           | Env var                    | Default | Why |
-|--------------------|----------------------------|---------|-----|
-| api                | `API_POSTGRES_MAX_CONNS`     | 10 | Serves concurrent HTTP requests |
-| alert-service       | `ALERT_POSTGRES_MAX_CONNS`   | 10 | One shared pool for the alert store, incident store, and rule cache — alert-service used to open a second, independent pool just for the rule cache; that duplication is gone, see `newRuleCache` in `services/alert-service/rules.go` |
-| anomaly-detector    | `ANOMALY_POSTGRES_MAX_CONNS` | 5  | Only used for its periodically-refreshed device/sensor catalog, not per-event |
-| `make seed` / `scripts/seed` | `SEED_POSTGRES_MAX_CONNS` | 4 | One-shot job |
-| simulator (`loadSensorCatalog`) | `SIM_POSTGRES_MAX_CONNS` | 4 | Pool exists only for one startup query, then closes |
-
-ingestion and stream-processor don't appear here — neither talks to
-Postgres directly (ingestion only bridges MQTT to Kafka; stream-processor
-writes to InfluxDB, not Postgres).

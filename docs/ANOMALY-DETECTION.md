@@ -14,7 +14,7 @@ Each sensor was seeded with a `min_operating_value`/`max_operating_value`
 (see [migrations/000001_core_hierarchy.up.sql](../migrations/000001_core_hierarchy.up.sql)).
 A reading outside that range fires, with severity scaling by how far outside
 as a fraction of the range's span (`>=50%` overshoot → CRITICAL, `>=20%` →
-HIGH, else WARNING). Implementation: [rules.go](../services/anomaly-detector/rules.go).
+HIGH, else WARNING). Implementation: [rules.py](../services/anomaly-detector/rules.py).
 
 This is the cheapest, fastest-firing detector and the one verified most
 extensively live — real seeded data with injected spikes produced real
@@ -24,7 +24,7 @@ extensively live — real seeded data with injected spikes produced real
 
 Each `(device_id, metric)` series gets its own exponentially-weighted
 moving mean and variance, updated online in O(1) per sample
-([stats.go](../services/anomaly-detector/stats.go)). A sample's z-score is
+([stats.py](../services/anomaly-detector/stats.py)). A sample's z-score is
 computed against the baseline *before* that sample is folded in, so one
 huge spike is judged against the prior baseline rather than a baseline it
 just dragged toward itself. EWMA (rather than a plain cumulative average)
@@ -37,7 +37,7 @@ Firing is suppressed until a series has accumulated `ANOMALY_MIN_SAMPLES`
 ## Level 3 — Isolation Forest
 
 A real implementation of Liu, Ting & Zhou (2008)
-([isolationforest.go](../services/anomaly-detector/isolationforest.go)):
+([isolationforest.py](../services/anomaly-detector/isolationforest.py)):
 each tree is built by recursively picking a random feature and a random
 split value, isolating points in far fewer splits than it takes to isolate
 a "normal" point buried in a dense cluster. Anomaly score is
@@ -58,7 +58,7 @@ statistically meaningless.
 
 **Training is periodic, not one-shot batch.** A rolling buffer
 (`ANOMALY_FOREST_BUFFER_SIZE`, default 512 feature vectors) accumulates per
-machine type as telemetry arrives (`featurestore.go`), and a background
+machine type as telemetry arrives (`featurestore.py`), and a background
 loop retrains that machine type's forest every `ANOMALY_FOREST_RETRAIN_SECONDS`
 (default 120s) once at least 60 samples exist. Between retrains, incoming
 events are scored against the current forest. This is what makes the
@@ -67,7 +67,7 @@ per-event retraining cost.
 
 ### Honest evaluation
 
-**What was measured**: [isolationforest_test.go](../services/anomaly-detector/isolationforest_test.go)
+**What was measured**: [test_isolationforest.py](../services/anomaly-detector/tests/test_isolationforest.py)
 trains a forest on a synthetic 3-feature Gaussian cluster (mean 50, stddev 2
 — standing in for a machine's steady operating band) and scores both
 held-out in-distribution points and deliberately far-outlier points. Result,
@@ -101,7 +101,7 @@ statistical one.
 ## Anomaly record schema
 
 Published to `anomalies.detected` (see `AnomalyDetected` in
-[pkg/events/telemetry.go](../pkg/events/telemetry.go)):
+[shared/events.py](../shared/events.py)):
 
 ```json
 {

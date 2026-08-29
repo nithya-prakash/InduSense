@@ -1,14 +1,21 @@
-FROM golang:1.25-alpine AS build
+FROM python:3.12-slim AS build
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY pkg/ ./pkg/
-COPY services/stream-processor/ ./services/stream-processor/
-RUN CGO_ENABLED=0 go build -o /out/stream-processor ./services/stream-processor
+COPY services/stream-processor/requirements.txt ./requirements.txt
+RUN python -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt
 
-FROM alpine:3.20
-RUN adduser -D -u 10001 appuser
+FROM python:3.12-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -u 10001 -m appuser
+COPY --from=build /venv /venv
+WORKDIR /app
+COPY shared/ ./shared/
+COPY services/stream-processor/ ./services/stream-processor/
+ENV PATH="/venv/bin:${PATH}" \
+    PYTHONPATH="/app" \
+    PYTHONUNBUFFERED=1
 USER appuser
-COPY --from=build /out/stream-processor /usr/local/bin/stream-processor
+WORKDIR /app/services/stream-processor
 EXPOSE 8082
-ENTRYPOINT ["/usr/local/bin/stream-processor"]
+ENTRYPOINT ["python", "main.py"]

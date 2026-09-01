@@ -19,14 +19,22 @@ class AnomalyCountTracker:
     def record(self, key: str, at: datetime, window_seconds: float) -> int:
         """Adds one occurrence at `at` for the given key and returns how
         many occurrences remain within `window_seconds` of `at` after
-        trimming older ones."""
+        trimming older ones.
+
+        Trims by filtering every stored timestamp against the cutoff,
+        rather than scanning/dropping only a leading prefix: `at` values
+        aren't guaranteed to arrive in non-decreasing order (Kafka
+        redelivery, backfill, or ordinary clock skew can all deliver an
+        earlier `at` after a later one), and a prefix-only trim leaves a
+        stale entry permanently stuck ahead of a newer one that never gets
+        old enough to be re-scanned past it -- inflating the count for
+        that key forever. A full filter costs O(n) instead of O(trimmed)
+        per call, which is fine given these lists are bounded to one
+        rule's window (typically a few minutes of anomalies, not an
+        unbounded history)."""
         with self._lock:
-            times = self._seen.get(key, [])
-            times.append(at)
             cutoff = at - timedelta(seconds=window_seconds)
-            i = 0
-            while i < len(times) and times[i] < cutoff:
-                i += 1
-            times = times[i:]
+            times = [t for t in self._seen.get(key, []) if t >= cutoff]
+            times.append(at)
             self._seen[key] = times
             return len(times)

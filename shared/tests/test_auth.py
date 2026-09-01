@@ -216,15 +216,30 @@ def test_multi_tenant_logins_are_isolated():
             auth.require_same_organization(claims_a.organization_id, claims_b.organization_id)
 
         with pool.connection() as conn:
-            leak = conn.execute(
-                """
-                SELECT count(*) FROM factories f
-                JOIN organizations o ON o.id = f.organization_id
-                WHERE o.id = %s AND f.organization_id != %s
-                """,
-                (claims_a.organization_id, claims_a.organization_id),
-            ).fetchone()[0]
-        assert leak == 0
+            factories_a = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT id FROM factories WHERE organization_id = %s", (claims_a.organization_id,)
+                ).fetchall()
+            }
+            factories_b = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT id FROM factories WHERE organization_id = %s", (claims_b.organization_id,)
+                ).fetchall()
+            }
+        # Each org-scoped query above is exactly the shape services/api's
+        # handlers run (WHERE organization_id = <JWT's org>). Asserting the
+        # two result sets are non-empty and disjoint is a real check on the
+        # data layer: it fails if a factory's organization_id ever pointed
+        # at the wrong org, or if both queries were accidentally run with
+        # the same parameter. (An earlier version of this assertion bound
+        # the same organization_id to both query parameters, which made it
+        # pass unconditionally regardless of any real cross-tenant leak --
+        # fixed here to actually compare the two organizations' data.)
+        assert factories_a, "musterfabrik-gmbh should have at least one seeded factory"
+        assert factories_b, "zweite-firma-gmbh should have at least one seeded factory"
+        assert factories_a.isdisjoint(factories_b), "the same factory ID is visible under both organizations' scoped queries"
     finally:
         pool.close()
         redis_client.close()

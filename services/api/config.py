@@ -37,6 +37,15 @@ def env_string_list(key: str, default: list[str] | None) -> list[str] | None:
     return [part.strip() for part in v.split(",") if part.strip()]
 
 
+# Well-known placeholder secrets shipped in .env.example and used as the
+# fallback default below. Anyone who reads this public repo knows them, so
+# a deployment that never overrides JWT_ACCESS_SECRET/JWT_REFRESH_SECRET can
+# have valid tokens forged for any user/organization/permission set -- see
+# Config.jwt_secrets_are_default() and main.py's startup check.
+DEFAULT_JWT_ACCESS_SECRET = "change-me-dev-only-access-secret"
+DEFAULT_JWT_REFRESH_SECRET = "change-me-dev-only-refresh-secret"
+
+
 @dataclass
 class Config:
     port: str
@@ -80,6 +89,14 @@ class Config:
     trust_proxy_headers: bool
     trusted_proxy_cidrs: list[str] = field(default_factory=list)
 
+    # "development" (default) or "production" -- gates whether shipping
+    # with the default JWT secrets is a loud warning or a hard refusal to
+    # start. See jwt_secrets_are_default().
+    environment: str = "development"
+
+    def jwt_secrets_are_default(self) -> bool:
+        return self.jwt_access_secret == DEFAULT_JWT_ACCESS_SECRET or self.jwt_refresh_secret == DEFAULT_JWT_REFRESH_SECRET
+
 
 def load_config() -> Config:
     return Config(
@@ -105,4 +122,5 @@ def load_config() -> Config:
         rate_limit_default_per_min=env_int("API_RATE_LIMIT_DEFAULT_PER_MIN", 120),
         trust_proxy_headers=env_bool("API_TRUST_PROXY_HEADERS", False),
         trusted_proxy_cidrs=env_string_list("API_TRUSTED_PROXY_CIDRS", None) or [],
+        environment=env_str("API_ENVIRONMENT", "development"),
     )

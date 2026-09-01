@@ -52,6 +52,24 @@ logger = logging_utils.init("api")
 
 cfg = load_config()
 
+if cfg.jwt_secrets_are_default():
+    if cfg.environment == "production":
+        raise RuntimeError(
+            "refusing to start with API_ENVIRONMENT=production and a default "
+            "JWT_ACCESS_SECRET/JWT_REFRESH_SECRET: these values are published "
+            "in .env.example, so anyone can forge a valid access token for any "
+            "user, organization, or permission set. Set both to real random "
+            "secrets before running in production."
+        )
+    logger.critical(
+        "JWT_ACCESS_SECRET and/or JWT_REFRESH_SECRET are still the default "
+        "dev-only values from .env.example -- anyone who has read this public "
+        "repo can forge a valid token for any user/organization/role. This is "
+        "expected for local development but must never reach a real "
+        "deployment; set API_ENVIRONMENT=production to make this a hard "
+        "startup failure instead of a warning."
+    )
+
 pool = ConnectionPool(cfg.postgres_dsn, min_size=1, max_size=cfg.postgres_max_conns, open=True, kwargs={"autocommit": True})
 redis_client = Redis(host=cfg.redis_addr.rsplit(":", 1)[0], port=int(cfg.redis_addr.rsplit(":", 1)[1]), password=cfg.redis_password or None, db=cfg.redis_db)
 

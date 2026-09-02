@@ -13,7 +13,7 @@ influxdb-client==1.45.0
 opentelemetry-exporter-otlp-proto-http==1.44.0
 opentelemetry-sdk==1.44.0
 paho-mqtt==2.1.0
-prometheus_client==0.21.0
+prometheus_client==0.26.0
 psycopg[binary]==3.2.3
 psycopg_pool==3.2.3
 pydantic==2.9.2

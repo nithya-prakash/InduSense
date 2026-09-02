@@ -1,6 +1,6 @@
 paho-mqtt==2.1.0
 confluent-kafka==2.6.1
 pydantic==2.9.2
-prometheus_client==0.21.0
+prometheus_client==0.26.0
 opentelemetry-sdk==1.44.0
 opentelemetry-exporter-otlp-proto-http==1.44.0

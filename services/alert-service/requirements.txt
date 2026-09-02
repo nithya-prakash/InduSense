@@ -1,4 +1,4 @@
-confluent-kafka==2.6.1
+confluent-kafka==2.15.0
 pydantic==2.9.2
 psycopg[binary]==3.2.3
 psycopg_pool==3.2.3

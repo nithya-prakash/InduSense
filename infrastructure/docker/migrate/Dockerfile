@@ -3,6 +3,6 @@
 # migrations/ into the same migrate/migrate binary the Makefile already
 # uses via `docker run`, so the Kubernetes migration Job needs no source
 # checkout, just this image.
-FROM migrate/migrate:v4.17.1
+FROM migrate/migrate:v4.19.1
 COPY migrations /migrations
 ENTRYPOINT ["migrate", "-path=/migrations"]

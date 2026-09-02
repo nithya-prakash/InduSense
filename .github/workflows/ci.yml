@@ -176,7 +176,14 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN's package-write permission wasn't taking effect
+          # against ghcr.io for this repo even with the repo-level
+          # "Read and write permissions" default set correctly (fresh
+          # runs still got permission_denied: write_package) -- a
+          # classic PAT with the write:packages scope sidesteps that
+          # entirely, since its permissions don't depend on the repo's
+          # Actions default at all.
+          password: ${{ secrets.GHCR_PAT }}
       - uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}

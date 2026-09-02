@@ -6,6 +6,18 @@ ingests real-time telemetry from thousands of machine sensors, detects
 abnormal behavior, raises alerts, and manages incidents — end to end,
 through real MQTT, Kafka, PostgreSQL, and InfluxDB, not mocked stand-ins.
 
+**Dashboard, live** — logging in, watching real-time alerts, drilling into an
+incident's audit trail, and a machine's telemetry chart with real InfluxDB
+data:
+
+![Dashboard demo](docs/media/dashboard-demo.gif)
+
+**Terminal, real output** — `docker compose ps`, a live health check, a real
+login, and the full test suite running against the actual stack (no output
+faked or trimmed beyond truncating the JWT for readability):
+
+![Terminal demo](docs/media/terminal-demo.gif)
+
 ## Why this project exists
 
 This is a portfolio project built to demonstrate real competence in

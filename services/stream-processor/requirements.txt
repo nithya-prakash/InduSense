@@ -1,4 +1,4 @@
-confluent-kafka==2.6.1
+confluent-kafka==2.15.0
 pydantic==2.9.2
 redis==5.2.0
 influxdb-client==1.45.0

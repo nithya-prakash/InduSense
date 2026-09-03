@@ -3,7 +3,7 @@ COMPOSE := docker compose
 
 .PHONY: setup up down logs ps restart clean \
         lint test unit-test integration-test contract-test e2e-test build-tests-image \
-        seed simulate simulate-docker load-test demo fmt vet migrate-up migrate-down
+        seed simulate simulate-docker load-test demo fmt vet migrate-up migrate-down evaluate
 
 MIGRATE_IMAGE := migrate/migrate:v4.17.1
 POSTGRES_DSN := postgres://indusense:indusense_dev_password@postgres:5432/indusense?sslmode=disable
@@ -159,3 +159,23 @@ load-test:
 ## demo: full scripted demo (infra -> migrate -> seed -> simulate -> dashboard)
 demo:
 	@echo "NOT YET IMPLEMENTED — assembled once all phases are complete"
+
+## evaluate: reproducible entry point for eval/ — runs every automated
+## test tier against the currently-running stack (requires `make up`
+## first) and prints a pointer to the full report. This does NOT re-run
+## the live load/latency/idempotency measurements in eval/results/
+## FINAL_REPORT.md -- those involve real timed Docker orchestration
+## (simulator bursts, MQTT publish-and-poll latency probes) that's
+## deliberately run by hand, not scripted, so its timing isn't silently
+## re-tuned by a future edit to this target. This target verifies the
+## repeatable part: does the test suite the report's numbers depend on
+## still pass.
+evaluate:
+	$(MAKE) unit-test
+	$(MAKE) contract-test
+	$(MAKE) integration-test
+	$(MAKE) e2e-test
+	@echo ""
+	@echo "Test suite complete. Full measured metrics (throughput, latency,"
+	@echo "idempotency, resilience) are in eval/results/FINAL_REPORT.md and"
+	@echo "eval/results/CV_SAFE_METRICS.md."

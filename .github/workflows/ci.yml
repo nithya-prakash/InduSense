@@ -51,6 +51,7 @@ jobs:
           - services/api/requirements.txt
           - simulator/requirements.txt
           - scripts/seed/requirements.txt
+          - tests/requirements.txt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

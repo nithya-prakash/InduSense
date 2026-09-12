@@ -3,7 +3,7 @@ COMPOSE := docker compose
 
 .PHONY: setup up down logs ps restart clean \
         lint test unit-test integration-test contract-test e2e-test build-tests-image \
-        seed simulate simulate-docker load-test demo fmt vet migrate-up migrate-down evaluate
+        seed simulate simulate-docker k8s-simulate load-test demo fmt vet migrate-up migrate-down evaluate
 
 MIGRATE_IMAGE := migrate/migrate:v4.17.1
 POSTGRES_DSN := postgres://indusense:indusense_dev_password@postgres:5432/indusense?sslmode=disable
@@ -149,6 +149,24 @@ simulate:
 
 ## simulate-docker: alias for `simulate` (kept for muscle memory / old docs)
 simulate-docker: simulate
+
+## k8s-simulate: generate traffic against a Helm-deployed InduSense
+#
+# Can't run from the host the way `make simulate` does against Compose —
+# Kafka's advertised listener only resolves inside the cluster (see the
+# Kubernetes + Helm phase doc), so the simulator has to run as an
+# in-cluster Job instead of a local process. That constraint is real and
+# isn't hidden here; this target exists so acting on it is one command
+# instead of a `helm upgrade --set` incantation you have to remember and
+# re-type correctly (including `--reuse-values`, without which other
+# values silently reset to chart defaults). Assumes a release named
+# `indusense` in the `indusense` namespace, matching the README's install
+# example — override with RELEASE=/NAMESPACE= if yours differ.
+RELEASE ?= indusense
+NAMESPACE ?= indusense
+k8s-simulate:
+	helm upgrade $(RELEASE) infrastructure/helm/indusense -n $(NAMESPACE) \
+		--reuse-values --set simulator.enabled=true
 
 ## load-test: run all k6 load tests against the running stack (requires `make seed`)
 load-test:

@@ -1,15 +1,41 @@
 # 17. Python rewrite
 
-Phases 1–16 built the backend in Go. It was later rewritten entirely to
-Python, one service at a time, each verified live against the real running
-stack before the next began — the same phased, real-infra-verified
-discipline the original Go build used. The motivation was simple: the
-project's owner doesn't read Go, which defeats the point of a portfolio
-project meant to be personally understood, defended, and maintained.
-Everything else — the Next.js frontend, PostgreSQL/InfluxDB/Redis/Kafka/
-Mosquitto infrastructure, Docker Compose topology, Helm chart, Kafka
-topics, DB schema, and REST/WebSocket contract — stayed identical, so
-nothing downstream needed to know the implementation language had changed.
+**Why this section exists, stated directly**: a full-backend language
+rewrite partway through a project can read as scope thrash — as if the
+tech stack wasn't thought through before Phase 1. It wasn't thrash here,
+and the reasoning is worth stating plainly rather than leaving it to be
+inferred.
+
+Go was the right choice for Phases 1–16 on its own terms: goroutines and
+channels map directly onto the worker-pool/bounded-queue pattern this
+project's MQTT ingestion and Kafka consumption actually need, and static
+binaries kept container images small. That reasoning held up — nothing
+about the Go implementation was broken or under-engineered; the full test
+suite, load tests, and a real Kubernetes deployment all passed against it.
+What changed was a different, harder constraint discovered only *after*
+building 16 phases of real, working infrastructure: a portfolio project
+only proves what its owner can personally read, defend, and extend without
+help, and Go's owner doesn't read Go. Sixteen phases of infrastructure that
+work isn't the same claim as sixteen phases the owner can walk a reviewer
+through line by line — and once that gap was clear, leaving it unaddressed
+would have been the actual scope failure, not the decision to fix it.
+
+The fix was a full, disciplined rewrite — not a partial rescue, not a
+second parallel implementation left half-finished, and not glossed over in
+this README. Rewritten one service at a time, each verified live against
+the real running stack before the next began, using the exact same
+phased, real-infra-verified discipline as the original Go build (see the
+commit history — one commit per service, matching this project's existing
+convention throughout). Everything *outside* the backend's implementation
+language — the Next.js frontend, PostgreSQL/InfluxDB/Redis/Kafka/Mosquitto
+infrastructure, Docker Compose topology, Helm chart, Kafka topics, DB
+schema, and REST/WebSocket contract — stayed identical, so nothing
+downstream needed to know the language had changed. The rewrite itself
+surfaced genuine bugs the original Go build never had (see below) and a
+concrete correctness fix during a later evaluation pass (see the README's
+"Delivery semantics" section) — evidence the same real-infra-verification
+discipline was actually applied twice, not that it was skipped the first
+time.
 
 ## Library mapping
 

@@ -31,16 +31,26 @@ curl localhost:8083/forests    # which machine types currently have a trained fo
 curl localhost:8083/metrics    # anomalies_detected_total{method}, isolation_forests_trained_total
 ```
 
-**Idempotency**: publishing to `anomalies.detected` is guarded by an atomic
-claim on the source telemetry event's `event_id`, via the `idempotency_keys`
-table ([idempotency.py](../../services/anomaly-detector/idempotency.py),
-scope `anomaly_detection`) — the same `INSERT ... ON CONFLICT DO NOTHING
-RETURNING` pattern alert-service uses for alert dedup. Without it, Kafka
-redelivering a `telemetry.processed` message would run detection again and
-publish a second, distinct anomaly ID for the same physical reading — and,
-downstream, a second alert/incident. A redelivered event is detected as
-already-claimed and its detection result is simply not re-published; the
-offset is still committed.
+**Idempotency**: the whole detection pipeline for a given telemetry
+event — not just the final publish — is guarded by an atomic claim on the
+source event's `event_id`, via the `idempotency_keys` table
+([idempotency.py](../../services/anomaly-detector/idempotency.py), scope
+`anomaly_detection`) — the same `INSERT ... ON CONFLICT DO NOTHING
+RETURNING` pattern alert-service uses for alert dedup. The claim happens
+before the EWMA statistical tracker or the Isolation Forest's feature
+buffer ever see the reading, not just before publishing to
+`anomalies.detected`: an earlier version of this service claimed only
+around the publish, which meant a Kafka redelivery of `telemetry.processed`
+(e.g. after a crash between detection and offset commit — a normal
+occurrence under this system's at-least-once delivery, not a rare edge
+case) correctly skipped re-publishing a duplicate anomaly, but still
+silently folded the same physical reading into both statistical baselines
+a second time. See the README's "Delivery semantics" section and
+[shared/tests/test_idempotency.py](../../services/anomaly-detector/tests/test_idempotency.py)'s
+regression test for the fixed behavior — a redelivered event is now
+detected as already-claimed before any state mutation and the entire
+detection run is skipped, not just the publish; the offset is still
+committed.
 
 Publishing to `anomalies.detected` is wrapped in the same
 retry-with-backoff-plus-circuit-breaker pattern as stream-processor's

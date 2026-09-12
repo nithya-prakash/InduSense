@@ -51,9 +51,21 @@ a `post-install,post-upgrade` hook, off by default (`seed.enabled=false`) —
 the documented way to seed after the fact, and post-install-only hooks
 never fire on upgrades.
 
-**Traffic generation runs inside the cluster**, unlike Compose's simulator
-profile, which runs from the host machine — Kafka's advertised listener
-only resolves inside the cluster (see bug #1's fix).
+**Traffic generation runs inside the cluster, and that's a real operational
+tradeoff worth naming plainly rather than glossing over.** Compose's
+simulator profile runs as a plain host process; the Kubernetes path can't
+do that — Kafka's advertised listener only resolves inside the cluster
+network (see bug #1's fix), so any client outside it, simulator included,
+gets broker metadata pointing at a hostname it can't reach. The only ways
+around this are (a) run the load generator as a pod, which is what this
+chart does, or (b) expose an additional external Kafka listener with its
+own advertised address, which trades a real security/operational cost
+(another open port, another thing to secure) for a marginal convenience on
+a project whose actual point is the pipeline behind Kafka, not Kafka's own
+reachability from a laptop. (a) is the more honest choice at this scope.
+The remaining friction — remembering the exact `helm upgrade --set
+simulator.enabled=true --reuse-values` invocation — is real too, and is
+now just `make k8s-simulate` (see the top-level README).
 
 **Not implemented here**: an ingress controller/Ingress resource (written
 and gated behind `ingress.enabled=false`); Kafka/Postgres clustering or

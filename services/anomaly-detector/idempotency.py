@@ -1,12 +1,17 @@
-"""Exactly-once anomaly publication, the Python port of idempotency.go.
+"""Exactly-once anomaly *detection*, the Python port of idempotency.go.
 
-Atomically claims a source telemetry event's event_id for anomaly-detection
-processing, using the same INSERT...ON CONFLICT DO NOTHING RETURNING
-pattern already used by alert-service for race-safe, at-least-once
--delivery-tolerant dedup. Kafka redelivering telemetry.processed after a
-crash between detection and offset commit would otherwise re-run detection
-and publish a second AnomalyDetected (with a new anomaly_id) for the same
-underlying reading — this claim makes that a no-op instead.
+Atomically claims a source telemetry event's event_id before any
+detection work runs — not just before the anomaly publish — using the
+same INSERT...ON CONFLICT DO NOTHING RETURNING pattern already used by
+alert-service for race-safe, at-least-once-delivery-tolerant dedup. Kafka
+redelivering telemetry.processed after a crash between detection and
+offset commit would otherwise both (a) publish a second AnomalyDetected
+for the same reading, and (b) fold the same reading a second time into
+the EWMA statistical baseline and the Isolation Forest's training buffer
+even when (a) is correctly suppressed — claiming this early makes the
+whole redelivery a no-op, not just the publish. See the README's
+"Delivery semantics" section for why this distinction matters under this
+system's at-least-once delivery model.
 """
 
 from __future__ import annotations

@@ -141,6 +141,35 @@ def _process_message(cfg: Config, kio: KafkaIO, cat: Catalog, trackers: Statisti
             dlq_messages_total.inc()
             return True
 
+        # Claimed before any detector state is touched, not just before the
+        # anomaly publish: a Kafka redelivery of a telemetry.processed
+        # message we already ran detection for (e.g. after a crash between
+        # detection and offset commit) must be a full no-op, not just a
+        # no-op on re-publishing. Claiming only around publish_anomaly (the
+        # original design here) left trackers.update's EWMA baseline and
+        # fs.observe's Isolation Forest training buffer unprotected — a
+        # redelivered reading was folded into both a second time even
+        # though the resulting AnomalyDetected was correctly suppressed,
+        # silently skewing the statistical/ML baselines on every such
+        # redelivery. This is the real cost of at-least-once delivery this
+        # service was exposed to; see the "Delivery semantics" section of
+        # the README for the honest accounting of what is and isn't
+        # covered by idempotency in this pipeline.
+        try:
+            claimed = claim_telemetry_event_once(cat.pool(), evt.event_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "idempotency claim failed, leaving unacked for retry",
+                extra={"error": str(exc), "event_id": evt.event_id, "device_id": evt.device_id},
+            )
+            return False
+        if not claimed:
+            logger.info(
+                "duplicate telemetry event, already fully processed, skipping",
+                extra={"event_id": evt.event_id, "device_id": evt.device_id},
+            )
+            return True
+
         info = cat.lookup(evt.device_id)
         rng = MetricRange()
         has_range = False
@@ -171,25 +200,6 @@ def _process_message(cfg: Config, kio: KafkaIO, cat: Catalog, trackers: Statisti
 
         for r in results:
             anomalies_detected_total.labels(method=r.method).inc()
-
-        try:
-            claimed = claim_telemetry_event_once(cat.pool(), evt.event_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "idempotency claim failed, leaving unacked for retry",
-                extra={"error": str(exc), "event_id": evt.event_id, "device_id": evt.device_id},
-            )
-            return False
-        if not claimed:
-            # Kafka redelivered a telemetry.processed message we already ran
-            # detection for (e.g. after a crash between publish and commit) —
-            # re-publishing would create a second AnomalyDetected, and
-            # downstream, a second alert/incident, for the same reading.
-            logger.info(
-                "duplicate telemetry event, anomaly already published, skipping re-publish",
-                extra={"event_id": evt.event_id, "device_id": evt.device_id},
-            )
-            return True
 
         severity, score, methods, reason = combine_detections(results)
         anomaly = AnomalyDetected(

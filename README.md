@@ -18,6 +18,13 @@ faked or trimmed beyond truncating the JWT for readability):
 
 ![Terminal demo](docs/media/terminal-demo.gif)
 
+**Alert workflow, end to end** — a real out-of-range sensor reading published
+over MQTT, flowing through ingestion → Kafka → the anomaly detector → the
+alert service, appearing in the dashboard's live-updating Alerts view with no
+manual refresh, then acknowledged:
+
+![Alert workflow demo](docs/media/alert-workflow-demo.gif)
+
 ## Why this project exists
 
 This is a portfolio project built to demonstrate real competence in

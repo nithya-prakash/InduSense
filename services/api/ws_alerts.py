@@ -57,9 +57,15 @@ class WSHub:
     async def _broadcast_async(self, org_id: str, payload: bytes) -> None:
         async with self._lock:
             targets = [ws for ws, connected_org in self._clients.items() if connected_org == org_id]
+        # send_text, not send_bytes: payload is JSON. A binary frame arrives
+        # in the browser as a Blob (the WebSocket API's default binaryType),
+        # and `JSON.parse(evt.data)` on a Blob throws synchronously -- caught
+        # and silently swallowed by the frontend's malformed-frame handler,
+        # so the live feed never breaks loudly, it just never updates.
+        text = payload.decode("utf-8")
         for ws in targets:
             try:
-                await ws.send_bytes(payload)
+                await ws.send_text(text)
             except Exception as exc:  # noqa: BLE001
                 _logger.error("api: websocket write failed, dropping client: %s", exc)
                 await self.unregister(ws)

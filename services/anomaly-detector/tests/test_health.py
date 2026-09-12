@@ -47,24 +47,42 @@ def _wait_for_health_server(port: str) -> None:
     pytest.fail(f"health server on port {port} never became reachable")
 
 
-def test_start_health_server_bind_failure_is_logged(caplog):
+def test_start_health_server_bind_failure_is_logged():
     """Verifies the fix for a pre-GitHub audit finding: start_health_server
     used to silently swallow a bind failure (e.g. the port already in use),
     leaving /live and /ready silently unreachable for the process's whole
     lifetime with no log line explaining why. Occupies a real port first,
     then asserts the resulting bind failure is actually logged. Passes None
     dependencies deliberately — the handlers that would use them never run,
-    since the server never successfully starts serving."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ln:
-        ln.bind(("", 0))
-        ln.listen(1)
-        port = str(ln.getsockname()[1])
+    since the server never successfully starts serving.
 
-        with caplog.at_level(logging.ERROR, logger="anomaly-detector"):
+    Uses a locally-attached handler rather than relying on caplog's default
+    propagate-to-root capture: shared.logging_utils.init (called at import
+    time by main.py, which test_idempotency.py imports) sets this logger's
+    `propagate = False` and replaces its handlers, process-wide, for the
+    rest of the pytest session — whenever that happens before this test
+    runs (collection imports every test module up front, regardless of
+    file order), caplog's root-logger handler never sees the record even
+    though it really was emitted, and this assertion fails deterministically
+    despite the fix above working correctly."""
+    logger = logging.getLogger("anomaly-detector")
+    handler = logging.Handler()
+    records: list[logging.LogRecord] = []
+    handler.emit = records.append  # type: ignore[method-assign]
+    handler.setLevel(logging.ERROR)
+    logger.addHandler(handler)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ln:
+            ln.bind(("", 0))
+            ln.listen(1)
+            port = str(ln.getsockname()[1])
+
             result = start_health_server(port, None, None, None)
 
         assert result is None
-        assert any("health/metrics server" in r.message for r in caplog.records)
+        assert any("health/metrics server" in r.getMessage() for r in records)
+    finally:
+        logger.removeHandler(handler)
 
 
 def test_ready_endpoint_reflects_real_postgres_state():

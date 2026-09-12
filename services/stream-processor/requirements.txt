@@ -1,5 +1,5 @@
 confluent-kafka==2.15.0
-pydantic==2.9.2
+pydantic==2.13.5
 redis==8.1.0
 influxdb-client==1.45.0
 prometheus_client==0.26.0

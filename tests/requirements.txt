@@ -4,7 +4,7 @@
 # repo. Used to run pytest against ANY directory here: a single service's
 # own tests/, shared/tests, or the cross-service suites in this directory
 # (contract/integration/e2e).
-pytest==9.0.3
+pytest==9.1.1
 PyJWT==2.13.0
 bcrypt==5.0.0
 confluent-kafka==2.6.1

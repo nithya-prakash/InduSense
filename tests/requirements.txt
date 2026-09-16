@@ -5,7 +5,7 @@
 # own tests/, shared/tests, or the cross-service suites in this directory
 # (contract/integration/e2e).
 pytest==9.0.3
-PyJWT==2.13.0
+PyJWT==2.14.0
 bcrypt==5.0.0
 confluent-kafka==2.6.1
 fastapi==0.141.1

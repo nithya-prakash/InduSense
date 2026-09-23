@@ -1,7 +1,7 @@
 confluent-kafka==2.15.0
 pydantic==2.13.5
 psycopg[binary]==3.3.5
-psycopg_pool==3.3.1
+psycopg_pool==3.3.2
 prometheus_client==0.26.0
 opentelemetry-sdk==1.44.0
 opentelemetry-exporter-otlp-proto-http==1.44.0

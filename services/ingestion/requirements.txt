@@ -3,4 +3,4 @@ confluent-kafka==2.15.0
 pydantic==2.13.5
 prometheus_client==0.26.0
 opentelemetry-sdk==1.44.0
-opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.45.0

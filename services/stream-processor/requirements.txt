@@ -3,5 +3,5 @@ pydantic==2.13.5
 redis==8.1.0
 influxdb-client==1.50.0
 prometheus_client==0.26.0
-opentelemetry-sdk==1.44.0
+opentelemetry-sdk==1.45.0
 opentelemetry-exporter-otlp-proto-http==1.44.0

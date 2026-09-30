@@ -4,5 +4,5 @@ psycopg[binary]==3.3.4
 psycopg_pool==3.3.1
 prometheus_client==0.26.0
 requests==2.34.2
-opentelemetry-sdk==1.44.0
+opentelemetry-sdk==1.45.0
 opentelemetry-exporter-otlp-proto-http==1.44.0

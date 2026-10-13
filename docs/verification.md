@@ -23,7 +23,7 @@ volumes (`docker compose down -v`, as CI does) all passed.
 | Check | Result |
 |---|---|
 | `helm lint infrastructure/helm/indusense` (helm 3.16.2) | 0 failed; 37 manifests render |
-| `actionlint` 1.7.3 | Found `fail_level`, which is not an input of `reviewdog/action-actionlint@v1`; replaced with `fail_on_error: true`; rerun clean. The workflow has not run on GitHub since the change. |
+| `actionlint` 1.7.3 (local) | Its old metadata flagged `fail_level`, but the current `reviewdog/action-actionlint@v1` expects exactly that input (and deprecates `fail_on_error`), so `fail_level: error` was kept. CI's actionlint job also found deprecated `setup-python@v5` and `setup-node@v4`; both moved to `@v7`. |
 | `pip-audit` per `requirements.txt` | PyJWT 2.13.0 had 6 advisories (api, tests, seed). Bumped to 2.15.1; all 8 requirement files now report no known vulnerabilities. |
 | Frontend | `npm ci`, `npm run lint` (no findings) and `npm run build` succeeded (node 22) |
 
@@ -93,6 +93,7 @@ and could never see a 429 (the default limit had been raised from 10).
 - **k6 clean-close check.** The remaining client-side failures all carried the
   k6 error `websocket: close sent` (a write racing the client's own close
   frame). The check now ignores that one error and still fails on any other.
+- **Workflow:** `setup-python` and `setup-node` bumped to `@v7` (Node 20 runtime deprecation).
 - **PyJWT 2.15.1** in api, tests and seed (see above).
 - **Dependency group** applied together: OpenTelemetry sdk and exporter
   1.44 to 1.45 (they must move as a pair), psycopg 3.3.6, psycopg_pool

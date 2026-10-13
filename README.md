@@ -68,7 +68,7 @@ The backend was first built in Go (phases 1–16), then rewritten service by ser
 - The "Failed messages per service" Grafana panel is empty when no messages fail; that is expected, not a broken panel.
 - Delivery is at-least-once; a duplicate arriving after the dedup TTL (default 3600 s) is processed again.
 - Data is simulated; no real sensors.
-- The GitHub Actions workflow change (`fail_on_error`) has not run on GitHub yet; the last green run on `main` is from 12 Sep 2026.
+- The last run on `main` is from 12 Sep 2026; the October changes were validated on a pull request branch, not yet on `main`.
 
 ## Repository
 

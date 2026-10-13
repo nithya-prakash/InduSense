@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: reviewdog/action-actionlint@v1
         with:
-          fail_level: error
+          fail_on_error: true
 
   # A compile-check, not a real linter: ruff/mypy aren't configured yet
   # (see the migration plan's deferred future-phases list) -- this only

@@ -124,7 +124,19 @@ def require_same_organization(token_org_id: str, resource_org_id: str) -> None:
 # --- Password hashing (password.go) -------------------------------------
 
 
+# bcrypt only uses the first 72 bytes of its input. bcrypt 4 silently
+# truncated longer input; bcrypt 5 raises ValueError instead. The limit is in
+# UTF-8 bytes, not characters (one non-ASCII character can be 2-4 bytes).
+MAX_PASSWORD_BYTES = 72
+
+
+def _check_password_length(password: str) -> None:
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        raise ValueError(f"password must be at most {MAX_PASSWORD_BYTES} bytes (UTF-8)")
+
+
 def hash_password(plain: str) -> str:
+    _check_password_length(plain)
     return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
@@ -144,6 +156,7 @@ def validate_password_strength(password: str) -> None:
     etc.)."""
     if len(password) < 8:
         raise ValueError("password must be at least 8 characters")
+    _check_password_length(password)
     has_letter = any(c.isalpha() for c in password)
     has_digit = any(c.isdigit() for c in password)
     if not has_letter or not has_digit:

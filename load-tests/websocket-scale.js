@@ -63,11 +63,19 @@ export default function (data) {
       connected = true;
       socket.setTimeout(() => socket.close(), HOLD_OPEN_SECONDS * 1000);
     });
-    socket.on('error', () => {
-      cleanClose = false;
+    // k6 reports "websocket: close sent" when something writes after this
+    // client has already sent its own close frame. It is a client-side race
+    // on our deliberate close(), not a server fault, and arrives after the
+    // 'close' event, so it must not flip the check. Any other error does.
+    let fatalError = false;
+    socket.on('error', (e) => {
+      if (!String(e.error()).includes('close sent')) {
+        fatalError = true;
+        cleanClose = false;
+      }
     });
     socket.on('close', () => {
-      cleanClose = connected; // only "clean" if we actually got past open first
+      cleanClose = connected && !fatalError; // only "clean" if we got past open first
     });
   });
 

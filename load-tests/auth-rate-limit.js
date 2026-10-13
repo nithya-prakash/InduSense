@@ -1,6 +1,6 @@
 // Complementary to dashboard-read-load.js, and deliberately the opposite
 // design: this one *doesn't* spread identities across VUs. It proves the
-// login endpoint's per-IP rate limiter (default 10/min, from
+// login endpoint's per-IP rate limiter (default 30/min, from
 // API_RATE_LIMIT_AUTH_PER_MIN) actually holds under a real k6-generated
 // burst from a single client, not just a hand-rolled curl loop — a
 // security property worth its own load test, separate from the capacity
@@ -15,7 +15,7 @@ export const options = {
     auth_burst: {
       executor: 'shared-iterations',
       vus: 10,
-      iterations: 30, // well over the 10/min limit from one shared identity
+      iterations: 60, // twice the 30/min default limit (API_RATE_LIMIT_AUTH_PER_MIN), from one shared identity
       maxDuration: '30s',
     },
   },

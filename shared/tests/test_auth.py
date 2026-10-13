@@ -68,6 +68,9 @@ def test_hash_password_never_stores_plaintext():
     ("12345678", True),
     ("ValidPass123", False),
     ("exactly8a", False),
+    ("a1" + "x" * 70, False),        # exactly 72 bytes
+    ("a1" + "x" * 71, True),         # 73 bytes
+    ("a1" + "ä" * 36, True),         # 38 characters but 74 bytes
 ])
 def test_validate_password_strength_rejects_weak_passwords(password, want_err):
     if want_err:
@@ -243,3 +246,25 @@ def test_multi_tenant_logins_are_isolated():
     finally:
         pool.close()
         redis_client.close()
+
+
+def test_hash_password_rejects_more_than_72_bytes_instead_of_truncating():
+    with pytest.raises(ValueError, match="72 bytes"):
+        auth.hash_password("a1" + "x" * 71)
+
+
+def test_72_byte_password_round_trips():
+    pw = "a1" + "x" * 70
+    assert auth.verify_password(auth.hash_password(pw), pw)
+
+
+def test_verify_password_with_over_long_input_returns_false_not_an_error():
+    hashed = auth.hash_password("ValidPass123")
+    assert auth.verify_password(hashed, "ValidPass123" + "x" * 80) is False
+
+
+def test_hash_created_by_bcrypt_4_still_verifies():
+    # Real hash of "ChangeMe123!" produced by bcrypt 4.2.0, before the upgrade to 5.
+    old = "$2b$12$kJc81XEOF/rGM8Eb6jL4AOHttr4P5oZIPWskb9R5gMoR0bwRScQOC"
+    assert auth.verify_password(old, "ChangeMe123!") is True
+    assert auth.verify_password(old, "wrong-password1") is False

@@ -1,42 +1,31 @@
+# One grouped pull request per ecosystem per month. Grouping also keeps
+# packages that must move together (for example opentelemetry-sdk and its
+# exporter) in a single update. Security updates are not held back by the
+# schedule. Merge these by squashing or applying the changes by hand.
 version: 2
 updates:
   - package-ecosystem: pip
-    directory: /services/ingestion
+    directories:
+      - /services/ingestion
+      - /services/stream-processor
+      - /services/anomaly-detector
+      - /services/alert-service
+      - /services/api
+      - /simulator
+      - /scripts/seed
+      - /tests
     schedule:
-      interval: weekly
-  - package-ecosystem: pip
-    directory: /services/stream-processor
-    schedule:
-      interval: weekly
-  - package-ecosystem: pip
-    directory: /services/anomaly-detector
-    schedule:
-      interval: weekly
-  - package-ecosystem: pip
-    directory: /services/alert-service
-    schedule:
-      interval: weekly
-  - package-ecosystem: pip
-    directory: /services/api
-    schedule:
-      interval: weekly
-  - package-ecosystem: pip
-    directory: /simulator
-    schedule:
-      interval: weekly
-  - package-ecosystem: pip
-    directory: /scripts/seed
-    schedule:
-      interval: weekly
-  - package-ecosystem: pip
-    directory: /tests
-    schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      python-dependencies:
+        patterns: ["*"]
 
   - package-ecosystem: npm
     directory: /frontend
     schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 3
     groups:
       npm-dependencies:
         patterns: ["*"]
@@ -44,41 +33,26 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns: ["*"]
 
   - package-ecosystem: docker
-    directory: /frontend
+    directories:
+      - /frontend
+      - /infrastructure/docker/migrate
+      - /scripts/seed
+      - /services/alert-service
+      - /services/anomaly-detector
+      - /services/api
+      - /services/ingestion
+      - /services/stream-processor
+      - /simulator
     schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /infrastructure/docker/migrate
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /scripts/seed
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /services/alert-service
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /services/anomaly-detector
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /services/api
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /services/ingestion
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /services/stream-processor
-    schedule:
-      interval: weekly
-  - package-ecosystem: docker
-    directory: /simulator
-    schedule:
-      interval: weekly
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      docker-images:
+        patterns: ["*"]

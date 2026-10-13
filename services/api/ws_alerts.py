@@ -156,9 +156,15 @@ def register_ws_routes(hub: WSHub, access_secret: str) -> APIRouter:
 
         # Drain and discard any client-sent frames (this is a push-only
         # feed) purely to detect disconnects promptly.
+        # receive() hands back a "websocket.disconnect" message instead of
+        # raising; looping again after it makes Starlette raise
+        # WebSocketDisconnected (a RuntimeError), which used to surface as
+        # an unhandled ASGI exception on every normal client close.
         try:
             while True:
-                await websocket.receive()
+                message = await websocket.receive()
+                if message["type"] == "websocket.disconnect":
+                    break
         except WebSocketDisconnect:
             pass
         finally:

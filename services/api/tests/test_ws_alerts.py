@@ -43,3 +43,48 @@ def test_broadcast_sends_a_text_frame_not_binary():
 
     assert fake_ws.sent_text == ['{"event_type": "CREATED"}']
     assert fake_ws.sent_bytes == []
+
+
+def test_normal_client_close_does_not_raise_an_unhandled_asgi_error():
+    """Regression: the receive loop kept calling receive() after Starlette
+    had already delivered the disconnect message; the next call raises
+    WebSocketDisconnected (a RuntimeError), so every ordinary client close
+    surfaced as an unhandled ASGI exception. The fake mirrors Starlette:
+    one disconnect message, then an error on any further receive()."""
+    from shared import auth
+    from starlette.websockets import WebSocketDisconnected
+    from ws_alerts import register_ws_routes
+
+    secret = "test-secret-that-is-long-enough-for-hs256-use"
+    token = auth.issue_token(
+        auth._new_base_claims("u1", "11111111-1111-1111-1111-111111111111", "a@b.de", ["viewer"], auth.TOKEN_TYPE_ACCESS, 60, "j1"),
+        secret,
+    )
+
+    class _ClosingClient:
+        query_params = {"token": token}
+
+        def __init__(self):
+            self.disconnect_delivered = False
+            self.closed = False
+
+        async def accept(self) -> None:
+            pass
+
+        async def receive(self) -> dict:
+            if self.disconnect_delivered:
+                raise WebSocketDisconnected('Cannot call "receive" once a disconnect message has been received.')
+            self.disconnect_delivered = True
+            return {"type": "websocket.disconnect", "code": 1001}
+
+        async def close(self, code: int = 1000) -> None:
+            self.closed = True
+
+    hub = WSHub()
+    endpoint = register_ws_routes(hub, secret).routes[0].endpoint
+    client = _ClosingClient()
+
+    asyncio.run(endpoint(client))
+
+    assert client.closed
+    assert hub._clients == {}

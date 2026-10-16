@@ -1,5 +1,7 @@
 # InduSense — Industrial IoT Monitoring Platform
 
+[![CI](https://github.com/nithya-prakash/InduSense/actions/workflows/ci.yml/badge.svg)](https://github.com/nithya-prakash/InduSense/actions/workflows/ci.yml)
+
 Event-driven monitoring for a fictional German manufacturer: sensor telemetry over MQTT and Kafka, rule-based, statistical and Isolation Forest anomaly detection, alerts and incidents, a live Next.js dashboard. Python (FastAPI), PostgreSQL, InfluxDB, Redis, Kubernetes/Helm.
 
 ![Dashboard demo](docs/media/dashboard-demo.gif)

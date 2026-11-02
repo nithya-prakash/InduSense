@@ -56,3 +56,8 @@ updates:
     groups:
       docker-images:
         patterns: ["*"]
+    ignore:
+      # Python 3.15 has no prebuilt confluent-kafka wheel yet, so the images
+      # would need a C toolchain. Revisit once wheels are published.
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

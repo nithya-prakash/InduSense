@@ -29,6 +29,11 @@ updates:
     groups:
       npm-dependencies:
         patterns: ["*"]
+    ignore:
+      # typescript-eslint does not support TypeScript 7 yet, so lint fails.
+      # Revisit once it does.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
